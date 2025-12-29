@@ -10,8 +10,8 @@ import os
 
 # 引入基础组件
 from utils.ConnectHandler_client import ConnectHandler
-from utils.FL_utils import DatasetSplit
-from utils.get_dataset import get_dataset
+from utils.FL_utils import *
+from utils.get_dataset import *
 from utils.options import args_parser
 from utils.set_seed import set_random_seed
 
