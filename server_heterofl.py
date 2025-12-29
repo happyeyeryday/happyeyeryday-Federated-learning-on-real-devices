@@ -259,122 +259,97 @@ def summary_evaluate(net, dataset_test, device):
 if __name__ == '__main__':
     args = args_parser()
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
-    
-    client_mac_map = {
-        0: "3c:6d:66:28:57:90",  # Orin
-        1: "48:b0:2d:2f:e2:d9",  # Xavier
-        2: "48:b0:2d:2f:eb:0e",  
-        3: "48:b0:2d:3c:cc:df", 
-        4: "48:b0:2d:3c:ca:27",  # Nano 2
-        5: "48:b0:2d:3c:ca:20",
-        6: "48:b0:2d:3c:ca:2e",
-        7: "48:b0:2d:3c:cc:ff",
-        8: "48:b0:2d:3c:ca:18",
-        9: "48:b0:2d:3c:cc:f3",
-    }
 
+    # [配置] 设备信息表
     device_info_map = {
         0: {'mac': "3c:6d:66:28:57:90", 'ip': "192.168.31.19"}, # Orin
         1: {'mac': "48:b0:2d:2f:e2:d9", 'ip': "192.168.31.243"}, # Xavier
         2: {'mac': "48:b0:2d:2f:eb:0e", 'ip': "192.168.31.198"}, # Xavier
-        3: {'mac': "48:b0:2d:3c:cc:df", 'ip': "192.168.31.121"}, # Nano 2
-        4: {'mac': "48:b0:2d:3c:ca:27", 'ip': "192.168.31.237"}, # Nano 2
-        5: {'mac': "48:b0:2d:3c:ca:20", 'ip': "192.168.31.231"}, # Nano 2
-        6: {'mac': "48:b0:2d:3c:ca:2e", 'ip': "192.168.31.244"}, # Nano 2
-        7: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.154"}, # Nano 2
-        8: {'mac': "48:b0:2d:3c:ca:18", 'ip': "192.168.31.239"}, # Nano 2
-        9: {'mac': "48:b0:2d:3c:cc:f3", 'ip': "192.168.31.142"}, # Nano 2
+        3: {'mac': "48:b0:2d:3c:cc:df", 'ip': "192.168.31.121"}, # Nano
+        4: {'mac': "48:b0:2d:3c:ca:27", 'ip': "192.168.31.237"}, # Nano
+        5: {'mac': "48:b0:2d:3c:ca:20", 'ip': "192.168.31.231"}, # Nano
+        6: {'mac': "48:b0:2d:3c:ca:2e", 'ip': "192.168.31.244"}, # Nano
+        7: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.154"}, # Nano
+        8: {'mac': "48:b0:2d:3c:ca:18", 'ip': "192.168.31.239"}, # Nano
+        9: {'mac': "48:b0:2d:3c:cc:f3", 'ip': "192.168.31.142"}, # Nano
     }
 
-    # 验证模型最后一层命名
     print("验证模型结构...")
     if 'resnet18' in args.model:
+        # 使用统一的 hetero_model 工厂函数
         temp_net = resnet18()
-        print("ResNet18 最后几层参数:")
-        keys = list(temp_net.state_dict().keys())
-        for key in keys[-3:]:
-            print(f"  {key}: {temp_net.state_dict()[key].shape}")
         del temp_net
 
-    #增加全局分配表
-    device_rates_map = {}
-    for i in range(num_device):
-        if i == 0:          device_rates_map[i] = 1.0   # Orin (全量)
-        elif i == 1 or i == 2:   device_rates_map[i] = 0.5   # Xavier (中等)
-        else:               device_rates_map[i] = 0.25  # Nano (最小)
-
+    num_physical_clients = len(device_info_map)
     
+    # [新增] 活跃设备池，初始包含所有设备
+    active_clients = list(range(num_physical_clients))
+
+    # Rate 映射表
+    device_rates_map = {}
+    for i in range(num_physical_clients):
+        if i == 0:          device_rates_map[i] = 1.0   # Orin
+        elif i == 1 or i == 2:   device_rates_map[i] = 0.5   # Xavier
+        else:               device_rates_map[i] = 0.25  # Nano
+
     set_random_seed(args.seed)
     dataset_train, dataset_test, dict_users = get_dataset(args)
-    if args.algorithm in ['heterofl']:
-        if 'resnet18' in args.model:
-            net_glob = resnet18(model_rate=1.0, track=True)
-            net_glob.apply(init_weights)
-            net_glob.to(args.device)
-        if 'vgg' in args.model:
-            net_glob = VGG16_entire()
-            net_glob.apply(init_weights)
-            net_glob.to(args.device)
-        if 'resnet8' in args.model:
-            net_glob = ResNet8_entire()
-            net_glob.apply(init_weights)
-            net_glob.to(args.device)
+    
+    logger.info("Initializing HeteroFL Global Model...")
+    net_glob = resnet18(model_rate=1.0, track=True)
+    net_glob.apply(init_weights)
+    net_glob.to(args.device)
+
     summary_acc_test_collect = []
     time_collect = []
     if torch.cuda.is_available():
         torch.backends.cudnn.deterministic = True
         print(torch.cuda.get_device_name(0))
 
+    logger.info(f"🔌 Server listening for {num_physical_clients} clients...")
+    connectHandler = ConnectHandler(num_physical_clients, args.HOST, args.POST)
 
-    num_device = int(args.num_users / Reuse_ratio)
-
-    m = max(int(args.frac * num_device), 1)
-
-    # connectHandler = ConnectHandler(args.num_users, args.HOST, args.POST)
-    connectHandler = ConnectHandler(num_device, args.HOST, args.POST)
-
+    # 目标采样数 (例如 5)
+    target_m = max(int(args.frac * num_physical_clients), 1)
 
     for iter in range(args.epochs):
+        # [Step 2.2: 检查是否有存活设备]
+        if not active_clients:
+            logger.critical("🪫 All clients have run out of battery. Stopping training.")
+            break
+        
+        logger.info(f"🔋 Active Clients Pool: {active_clients} (Total: {len(active_clients)})")
 
-        # idxs_devices = np.random.choice(range(num_device), m, replace=False)
-
-        # idxs_drift = np.random.randint(0, Reuse_ratio, size=len(idxs_devices))
-        # idxs_users = idxs_devices + num_device * idxs_drift
-
+        # [Step 2.2: 动态采样]
+        # 如果活跃设备少于目标采样数，则全选
+        current_m = min(target_m, len(active_clients))
+        
         if iter == 0:
-            # 确保 Orin (ID=0) 在第一轮被选中
-            # 并且为了避免只有一个参与者导致 BN 计算问题，可以多带一个 Nano
-            idxs_users = [0, 5] # 例如：强制选中 Orin(0) 和 Nano(2)
-            logger.warning("Round 0: Forcing selection of Client 0 (Orin) to initialize BN stats.")
+            # 第一轮 Hack: 强制选中 Orin (如果它还活着)
+            idxs_users = [0, 5] if (0 in active_clients and 5 in active_clients) else np.random.choice(active_clients, current_m, replace=False)
+            logger.warning("Round 0: Trying to force selection of Client 0.")
         else:
-            idxs_devices = np.random.choice(range(num_device), m, replace=False)
+            # 从活跃池中采样
+            idxs_users = np.random.choice(active_clients, current_m, replace=False)
 
-            idxs_drift = np.random.randint(0, Reuse_ratio, size=len(idxs_devices))
-            idxs_users = idxs_devices + num_device * idxs_drift
+        print("round:", iter, " choose client:", idxs_users)
 
-        print("round:", iter, " choose client:",idxs_users)
-
-        # target_macs = [client_mac_map.get(idx) for idx in idxs_users if idx in client_mac_map]
-
+        # 唤醒选中的设备
         mac_to_ip_to_wake = {
             device_info_map[idx]['mac']: device_info_map[idx]['ip']
             for idx in idxs_users if idx in device_info_map
         }
+        wake_clients(mac_to_ip_to_wake, total_timeout=10) # 唤醒超时适当放宽
 
-        wake_clients(mac_to_ip_to_wake, total_timeout=15)
-
-         # --- 修改 A: 下发逻辑 (Downlink) ---
-        # 不再发送 net_glob，而是切片
+        # 下发模型
         for idx in idxs_users:
-            device_id = idx % num_device
-            current_rate = device_rates_map[device_id] # 查表
+            device_id = idx # 物理 ID
+            current_rate = device_rates_map[device_id]
             
             msg = dict()
-            # 【直接调用新函数】
             w_local_slice = hetero_distribute(net_glob.state_dict(), current_rate)
-            # 关键：调用切片函数
             msg['net'] = w_local_slice
-            msg['rate'] = current_rate  # 告诉 Client 它的缩放比例
+            msg['rate'] = current_rate
             msg['idxs_list'] = dict_users[idx]
             msg['type'] = 'net'
             msg['round'] = iter
@@ -382,33 +357,63 @@ if __name__ == '__main__':
             logger.info("send net (rate={}) to client {}".format(current_rate, idx))
             connectHandler.sendData(device_id, msg)
 
-
+        # [Step 2.2: 接收与处理退出消息]
         w_local_client = []
-        client_rates_this_round = [] # 记录这一轮收到的模型对应的 rate
-        while len(w_local_client) < len(idxs_users):
-            print("w_local_client:", len(w_local_client))
-            msg, client_idx = connectHandler.receiveData()
-            print("recv net from client {}".format(client_idx))
-            if msg['type'] == 'net':
+        client_rates_this_round = [] 
+        
+        # 我们期望收到 len(idxs_users) 个回复 (不论是模型还是退出通知)
+        responses_received = 0
+        expected_responses = len(idxs_users)
+        
+        while responses_received < expected_responses:
+            try:
+                msg, client_idx = connectHandler.receiveData()
+            except Exception as e:
+                logger.error(f"Error receiving data: {e}. Skipping this client.")
+                responses_received += 1
+                continue
+            responses_received += 1
+            
+            if msg['type'] == 'status' and msg.get('status') == 'low_battery':
+                logger.warning(f"🪫 Client {client_idx} reported LOW BATTERY and is exiting the pool.")
+                
+                # [🔥 新增: 发送 ACK 确认]
+                ack_msg = {'type': 'shutdown_ack'}
+                logger.info(f"📤 Sending Shutdown ACK to Client {client_idx}...")
+                if connectHandler.sendData(client_idx, ack_msg):
+                    logger.success(f"✅ ACK sent to Client {client_idx}.")
+                else:
+                    logger.error(f"❌ Failed to send ACK to Client {client_idx}.")
+
+                # 从活跃列表中移除
+                if client_idx in active_clients:
+                    active_clients.remove(client_idx)
+                # 注意：这里不把它的模型加入 w_local_client，因为它没训练
+
+                
+            # [处理正常模型]
+            elif msg['type'] == 'net':
+                logger.info(f"📥 Received model from Client {client_idx}")
                 net = msg['net']
                 w_local_client.append(net)
-                rate = msg.get('rate', device_rates_map[client_idx % num_device])
+                rate = msg.get('rate', device_rates_map[client_idx])
                 client_rates_this_round.append(rate)
-        #使用新聚合
-        # w_local = [copy.deepcopy(net.state_dict()) for net in w_local_client]
-        # w_glob = FedAvg(w_local)
-        w_glob = hetero_aggregate(w_local_client, client_rates_this_round, net_glob)
-        net_glob.load_state_dict(w_glob,strict=False)
+            
+            else:
+                logger.warning(f"Received unknown message type from Client {client_idx}")
 
-        #使用新方法计算bn层
-        # 注意：dataset_train 需要传入
+        # 聚合 (只聚合成功返回模型的 Client)
+        if len(w_local_client) > 0:
+            logger.info(f"⚙️  Aggregating {len(w_local_client)} models...")
+            w_glob = hetero_aggregate(w_local_client, client_rates_this_round, net_glob)
+            net_glob.load_state_dict(w_glob, strict=False)
+        else:
+            logger.warning("⚠️ No models received this round. Skipping aggregation.")
+
+        # BN 校准与评估
         net_glob_calibrated = stats(dataset_train, net_glob, args)
-
-        # 使用校准后的模型进行评估
+        
         acc = summary_evaluate(net_glob_calibrated, dataset_test, args.device) * 100
-        # acc = summary_evaluate(copy.deepcopy(net_glob).to(args.device),
-        #        dataset_test, args.device) * 100
-        # 如果你想保存模型，最好保存这个校准过的
         net_glob = net_glob_calibrated 
 
         current_time = time.time()

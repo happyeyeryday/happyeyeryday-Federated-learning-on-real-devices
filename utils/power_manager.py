@@ -2,13 +2,100 @@ import os
 import time
 import subprocess
 from loguru import logger
-from ping3 import ping, verbose_ping
+from ping3 import ping
+# ==========================================
+# 功耗与电池配置区域
+# ==========================================
+
+POWER_CONFIG = {
+    'orin': {
+        'train': 20.6937,   # 训练时的平均功耗
+        'idle': 7.6252,     # 开机但未训练时的功耗 (等待)
+        'sleep': 1.5524,    # suspend 状态下的功耗
+        'communication':7.723,
+    },
+    'xavier': {
+        'train': 16.0971,
+        'idle': 5.7406,
+        'sleep': 1.8653,
+        'communication':5.7716,
+
+    },
+    'nano': {
+        'train': 10.013,
+        'idle': 2.9454,
+        'sleep': 0.4328,
+        'communication':3.0533,
+    }
+}
+
+# [TODO] 在此处填写你为设备模拟的总电量 (单位：焦耳)
+BATTERY_CAPACITY = {
+    'orin': 20000,  # J
+    'xavier': 20000, # J
+    'nano': 20000,   # J
+}
+
+
+class BatteryManager:
+    """
+    负责模拟和管理客户端设备电池电量的类。
+    """
+    def __init__(self, device_type: str):
+        if device_type not in POWER_CONFIG:
+            raise ValueError(f"Unknown device_type: {device_type}. Must be one of {list(POWER_CONFIG.keys())}")
+        
+        self.device_type = device_type
+        self.power_profile = POWER_CONFIG[device_type]
+        self.total_capacity = BATTERY_CAPACITY[device_type]
+        self.current_charge = float(self.total_capacity) # 当前电量 (J)
+
+        logger.info(f"🔋 [Battery] Initialized. Capacity: {self.current_charge} J")
+
+    def consume(self, activity: str, duration_seconds: float):
+        """
+        根据活动和持续时间计算并扣除电量。
+
+        Args:
+            activity (str): 活动类型 ('train', 'idle', 'sleep')。
+            duration_seconds (float): 活动持续的时间（秒）。
+        """
+        if activity not in self.power_profile:
+            logger.warning(f"Unknown activity '{activity}'. Using 'idle' power consumption.")
+            activity = 'idle'
+            
+        power_w = self.power_profile[activity]
+        
+        # 功耗 (J) = 功率 (W) * 秒(s)
+        consumed_joules = power_w * duration_seconds
+        self.current_charge -= consumed_joules
+        
+        # 确保电量不为负
+        self.current_charge = max(0, self.current_charge)
+        
+        percentage = (self.current_charge / self.total_capacity) * 100
+        
+        logger.info(
+            f"⚡ [Battery] Activity: {activity} ({duration_seconds:.1f}s). "
+            f"Consumed: {consumed_joules:.4f} J. "
+            f"Remaining: {self.current_charge:.2f}/{self.total_capacity} J ({percentage:.1f}%)"
+        )
+        return self.current_charge
+
+    def check_energy(self, threshold=50.0):
+        """
+        检查当前电量是否高于阈值
+        """
+        is_enough = self.current_charge > threshold
+        if not is_enough:
+            logger.warning(f"🪫 [Battery] Low Level! Current: {self.current_charge:.1f} J < Threshold: {threshold} J")
+        return is_enough
 
 # ==========================================
 # Client 端使用的功能
 # ==========================================
 
-def smart_sleep(server_ip, interface="eth0", ping_timeout=30):
+def smart_sleep(server_ip, interface="eth0", ping_timeout=15):
     """
     Client 端智能休眠函数。
     适配 Orin/Xavier/Nano，解决网卡驱动导致的死机/无法唤醒问题。
