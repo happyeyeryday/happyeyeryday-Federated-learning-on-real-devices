@@ -4,11 +4,14 @@ from torch.utils.data import DataLoader
 import numpy as np
 import copy
 from loguru import logger
+import time
+import sys
+import os
 
 # 引入基础组件
 from utils.ConnectHandler_client import ConnectHandler
-from utils.FL_utils import *
-from utils.get_dataset import *
+from utils.FL_utils import DatasetSplit
+from utils.get_dataset import get_dataset
 from utils.options import args_parser
 from utils.set_seed import set_random_seed
 
@@ -16,6 +19,9 @@ from utils.set_seed import set_random_seed
 # 我们需要直接引用 ResNet 类和 BasicBlock，以便手动构建非标准深度的模型
 from models.scalefl_resnet import ResNet, BasicBlock 
 from models.scalefl_modelutils import KDLoss
+
+# [新增] 引入 BatteryManager 和 休眠模块
+from utils.power_manager import smart_sleep, BatteryManager
 
 torch.backends.cudnn.benchmark = False
 torch.backends.cudnn.deterministic = True
@@ -78,15 +84,27 @@ if __name__ == '__main__':
     if not hasattr(args, 'KD_gamma'): args.KD_gamma = 0.5 # 蒸馏权重
     
     set_random_seed(args.seed)
+
+    # ========== [🔥 电池模拟 Step 1: 初始化] ==========
+    # 1. 定义 Client ID 到设备类型的映射
+    DEVICE_TYPE_MAP = {
+        0: 'orin',
+        1: 'xavier',
+        2: 'xavier',
+        # 3-9 默认 nano
+    }
+    device_type = DEVICE_TYPE_MAP.get(args.CID, 'nano')
+    
+    # 2. 实例化电池管理器
+    battery_manager = BatteryManager(device_type=device_type)
+
+    ID = args.CID
+    logger.info(f"Client {ID} ({device_type}) starting...")
     
     # 获取数据
     dataset_train, dataset_test, dict_users = get_dataset(args)
     
-    ID = args.CID
-    # 假设 num_device_types = 4 (对应 Server 端的设定)
-    # Client ID 决定了其物理身份，连接时使用 ID % num_types ? 
     # 原代码逻辑: connectHandler = ConnectHandler(args.HOST, args.POST, ID)
-    # 我们保持原样，让 ConnectHandler 处理连接细节
     connectHandler = ConnectHandler(args.HOST, args.POST, ID)
     
     # 初始化 Loss
@@ -96,87 +114,170 @@ if __name__ == '__main__':
     local_model = None
     optimizer = None
 
-    while True:
-        # 1. 接收 Server 消息
-        recv = connectHandler.receiveFromServer()
-        if recv['type'] == 'net':
-            round_num = recv['round']
-            w_local_state_dict = recv['net']
-            idxs_list = recv['idxs_list']
-            
-            # 获取 ScaleFL 特定参数
-            rate = recv.get('rate', 1.0)
-            exit_idx = recv.get('exit_idx', 3) # 默认全深
-            global_ee_locs = recv.get('global_ee_locs', [2, 4, 6])
-            
-            # 2. 实例化本地模型 (动态构建)
-            local_model = build_local_model(args, rate, exit_idx, global_ee_locs)
-            
-            # 3. 加载参数
-            try:
-                # strict=True 是对 ScaleFL 正确性的终极检验
-                # 如果 build_local_model 构建的结构和 server 发来的 state_dict 完全匹配
-                # 这里就不会报错。如果报错，说明“隐式过滤”或“模型构建”有 Bug。
-                local_model.load_state_dict(w_local_state_dict, strict=True)
-                logger.info(f"Round {round_num}: Model loaded successfully (Rate {rate}, Exit {exit_idx}).")
-            except Exception as e:
-                logger.error(f"Load state dict failed: {e}")
-                # Debug info
-                logger.error(f"Local keys: {list(local_model.state_dict().keys())[:5]}")
-                logger.error(f"Recv keys: {list(w_local_state_dict.keys())[:5]}")
-                continue
+    last_timestamp = time.time() # 初始化时间戳
 
-            # 4. 训练准备
-            dtLoader = DataLoader(DatasetSplit(dataset_train, idxs_list),
-                                  batch_size=args.bs, shuffle=True)
-            local_model.train()
-            optimizer = torch.optim.SGD(local_model.parameters(), 
-                                        lr=args.lr * (args.lr_decay ** round_num),
-                                        momentum=args.momentum, 
-                                        weight_decay=args.weight_decay)
+    try:
+        while True:
+            # ========== [状态 1: 空闲等待] ==========
+            idle_duration = time.time() - last_timestamp
+            battery_manager.consume('idle', idle_duration)
 
-            # 5. 训练循环 (带自蒸馏)
-            epoch_loss = []
-            for epoch in range(args.local_ep):
-                batch_loss = []
-                for batch_idx, (images, labels) in enumerate(dtLoader):
-                    images, labels = images.to(args.device), labels.to(args.device)
-                    optimizer.zero_grad()
+            # ========== [状态 2: 接收数据] ==========
+            recv_start_time = time.time()
+
+            logger.info("Waiting for server command...")
+            recv = connectHandler.receiveFromServer()
+
+            # [更新电量] 计算通讯功耗
+            recv_duration = time.time() - recv_start_time
+            battery_manager.consume('communication', recv_duration) 
+
+            if recv and recv['type'] == 'net':
+                # ========================================================
+                # [🔥 关键修改: 训练前检查电量]
+                # ========================================================
+                if not battery_manager.check_energy(threshold=50.0):
+                    logger.warning(f"🪫 Client {ID} battery critical (<50J). Initiating shutdown protocol.")
                     
-                    # ScaleFL Forward: 返回列表 [exit_0_out, exit_1_out, ..., final_out]
-                    outputs = local_model(images)
+                    # 1. 发送退出通知
+                    msg = {'type': 'status', 'status': 'low_battery'}
+                    upload_start = time.time()
+                    connectHandler.uploadToServer(msg)
+                    battery_manager.consume('communication', time.time() - upload_start)
                     
-                    # 计算 Loss
-                    # 最后一个输出作为 Teacher (Soft Target)
-                    teacher_output = outputs[-1].detach() 
+                    # 2. 等待 Server 确认 (ACK)
+                    logger.info("⏳ Waiting for server confirmation to shutdown...")
+                    ack = connectHandler.receiveFromServer()
                     
-                    loss = 0.0
-                    # 遍历所有出口
-                    for i, output in enumerate(outputs):
-                        # 如果是最后一个出口(Teacher本身)，只算 CrossEntropy，不算 KL (gamma_active=False)
-                        is_teacher = (i == len(outputs) - 1)
-                        
-                        # 调用 KDLoss
-                        # loss_fn_kd(pred, target, soft_target, gamma_active)
-                        # 注意：ScaleFL 论文中所有 exit 都要算 CE Loss
-                        l = criterion.loss_fn_kd(output, labels, teacher_output, gamma_active=not is_teacher)
-                        loss += l
+                    if ack and ack.get('type') == 'shutdown_ack':
+                        logger.success("✅ Server acknowledged shutdown. Powering off.")
+                    else:
+                        logger.warning("⚠️ No ACK received or unknown message, forcing shutdown.")
                     
-                    # 也可以选择加权求和，ScaleFL 论文通常是直接 sum
-                    loss.backward()
-                    optimizer.step()
-                    batch_loss.append(loss.item())
+                    # 3. 退出脚本 (模拟自动关机)
+                    os.system("sudo poweroff")
+                    break
+
+                # ========================================================
+                # 电量充足，继续训练流程
+                # ========================================================
+
+                round_num = recv['round']
+                w_local_state_dict = recv['net']
+                idxs_list = recv['idxs_list']
                 
-                epoch_loss.append(sum(batch_loss)/len(batch_loss))
+                # 获取 ScaleFL 特定参数
+                rate = recv.get('rate', 1.0)
+                exit_idx = recv.get('exit_idx', 3) # 默认全深
+                global_ee_locs = recv.get('global_ee_locs', [2, 4, 6])
+                
+                # 2. 实例化本地模型 (动态构建)
+                local_model = build_local_model(args, rate, exit_idx, global_ee_locs)
+                
+                # 3. 加载参数
+                try:
+                    # strict=True 是对 ScaleFL 正确性的终极检验
+                    local_model.load_state_dict(w_local_state_dict, strict=True)
+                    logger.info(f"Round {round_num}: Model loaded successfully (Rate {rate}, Exit {exit_idx}).")
+                except Exception as e:
+                    logger.error(f"Load state dict failed: {e}")
+                    # Debug info
+                    logger.error(f"Local keys: {list(local_model.state_dict().keys())[:5]}")
+                    logger.error(f"Recv keys: {list(w_local_state_dict.keys())[:5]}")
+                    continue
 
-            logger.info(f"Round {round_num} finished. Avg Loss: {sum(epoch_loss)/len(epoch_loss):.4f}")
+                # 4. 训练准备
+                dtLoader = DataLoader(DatasetSplit(dataset_train, idxs_list),
+                                    batch_size=args.bs, shuffle=True)
+                local_model.train()
+                optimizer = torch.optim.SGD(local_model.parameters(), 
+                                            lr=args.lr * (args.lr_decay ** round_num),
+                                            momentum=args.momentum, 
+                                            weight_decay=args.weight_decay)
 
-            # 6. 回传结果
-            msg = dict()
-            msg['type'] = 'net'
-            # 必须回传 state_dict，以便 Server 的隐式聚合生效
-            # 这里的 state_dict 天然只包含 Client 拥有的层
-            msg['net'] = copy.deepcopy(local_model.state_dict())
-            msg['rate'] = rate # 回传 rate 方便 Server 聚合
-            
-            connectHandler.uploadToServer(msg)
+                # 5. 训练循环 (带自蒸馏)
+                # ========== [状态 3: 训练] ==========
+                train_start_time = time.time()
+                epoch_loss = []
+
+                for epoch in range(args.local_ep):
+                    batch_loss = []
+                    for batch_idx, (images, labels) in enumerate(dtLoader):
+                        images, labels = images.to(args.device), labels.to(args.device)
+                        optimizer.zero_grad()
+                        
+                        # ScaleFL Forward: 返回列表 [exit_0_out, exit_1_out, ..., final_out]
+                        outputs = local_model(images)
+                        
+                        # 计算 Loss
+                        # 最后一个输出作为 Teacher (Soft Target)
+                        teacher_output = outputs[-1].detach() 
+                        
+                        loss = 0.0
+                        # 遍历所有出口
+                        for i, output in enumerate(outputs):
+                            # 如果是最后一个出口(Teacher本身)，只算 CrossEntropy，不算 KL (gamma_active=False)
+                            is_teacher = (i == len(outputs) - 1)
+                            
+                            # 调用 KDLoss
+                            # loss_fn_kd(pred, target, soft_target, gamma_active)
+                            # 注意：ScaleFL 论文中所有 exit 都要算 CE Loss
+                            l = criterion.loss_fn_kd(output, labels, teacher_output, gamma_active=not is_teacher)
+                            loss += l
+                        
+                        # 也可以选择加权求和，ScaleFL 论文通常是直接 sum
+                        loss.backward()
+                        optimizer.step()
+                        batch_loss.append(loss.item())
+                    
+                    epoch_loss.append(sum(batch_loss)/len(batch_loss))
+
+                # [更新电量]
+                train_duration = time.time() - train_start_time
+                battery_manager.consume('train', train_duration)
+
+                logger.info(f"Round {round_num} finished. Avg Loss: {sum(epoch_loss)/len(epoch_loss):.4f}")
+
+                # 6. 回传结果
+                msg = dict()
+                msg['type'] = 'net'
+                # 必须回传 state_dict，以便 Server 的隐式聚合生效
+                # 这里的 state_dict 天然只包含 Client 拥有的层
+                msg['net'] = copy.deepcopy(local_model.state_dict())
+                msg['rate'] = rate # 回传 rate 方便 Server 聚合
+                
+                # ========== [状态 4: 上传数据] ==========
+                logger.info(f"📤 [Client {ID}] Uploading model...")
+                upload_start_time = time.time()
+                connectHandler.uploadToServer(msg)
+                
+                # [更新电量]
+                upload_duration = time.time() - upload_start_time
+                battery_manager.consume('communication', upload_duration) 
+                
+                logger.success(f"✅ [Client {ID}] Upload complete.")
+
+                # ========================================
+                
+                # 记录休眠前的时间戳
+                last_timestamp = time.time()
+
+                # ========== [状态 5: 休眠] ==========
+                smart_sleep(server_ip=args.HOST)
+                
+                # 唤醒后，计算休眠功耗
+                wake_up_time = time.time()
+                sleep_duration = wake_up_time - last_timestamp
+                battery_manager.consume('sleep', sleep_duration)
+                
+                # 更新时间戳，用于计算下一次 idle
+                last_timestamp = wake_up_time
+
+    except (KeyboardInterrupt, ConnectionResetError, EOFError) as e:
+        logger.warning(f"Connection or user interruption: {e}")
+    except Exception as e:
+        logger.critical(f"!!!!!!!!!!!!!! UNEXPECTED CRASH !!!!!!!!!!!!!!")
+        logger.critical(f"Error Type: {type(e).__name__}")
+        logger.critical(f"Error Message: {e}")
+    finally:
+        logger.critical("!!!!!!!!!!!!!! SCRIPT IS EXITING !!!!!!!!!!!!!!")
