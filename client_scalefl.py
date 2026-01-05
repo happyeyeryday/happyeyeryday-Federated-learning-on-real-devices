@@ -245,17 +245,24 @@ if __name__ == '__main__':
                 # 这里的 state_dict 天然只包含 Client 拥有的层
                 msg['net'] = copy.deepcopy(local_model.state_dict())
                 msg['rate'] = rate # 回传 rate 方便 Server 聚合
-                
-                # ========== [状态 4: 上传数据] ==========
-                logger.info(f"📤 [Client {ID}] Uploading model...")
+    
+                # ========== [🔥 电池模拟 Step 5: 计算上传功耗] ==========
                 upload_start_time = time.time()
+                logger.info(f"📤 [Client {ID}] Uploading model...")
                 connectHandler.uploadToServer(msg)
                 
-                # [更新电量]
-                upload_duration = time.time() - upload_start_time
-                battery_manager.consume('communication', upload_duration) 
+                # [🔥 新增: 等待 Server 确认接收]
+                logger.info("⏳ Waiting for server confirmation (ACK)...")
+                ack_msg = connectHandler.receiveFromServer()
                 
-                logger.success(f"✅ [Client {ID}] Upload complete.")
+                upload_duration = time.time() - upload_start_time
+                battery_manager.consume('communication', upload_duration)
+                
+                if ack_msg and ack_msg.get('type') == 'upload_ack':
+                    logger.success(f"✅ [Client {ID}] Server confirmed receipt. Preparing to sleep.")
+                else:
+                    logger.warning(f"⚠️ Did not receive standard ACK, but proceeding to sleep. Msg: {ack_msg}")
+
 
                 # ========================================
                 

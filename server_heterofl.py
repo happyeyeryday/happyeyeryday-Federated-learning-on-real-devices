@@ -398,6 +398,9 @@ if __name__ == '__main__':
                 w_local_client.append(net)
                 rate = msg.get('rate', device_rates_map[client_idx])
                 client_rates_this_round.append(rate)
+                ack_msg = {'type': 'upload_ack'}
+                connectHandler.sendData(client_idx, ack_msg)
+                
             
             else:
                 logger.warning(f"Received unknown message type from Client {client_idx}")

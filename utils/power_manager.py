@@ -31,9 +31,9 @@ POWER_CONFIG = {
 
 # [TODO] 在此处填写你为设备模拟的总电量 (单位：焦耳)
 BATTERY_CAPACITY = {
-    'orin': 100000,  # J
-    'xavier': 100000, # J
-    'nano': 100000,   # J
+    'orin': 50000,  # J
+    'xavier': 50000, # J
+    'nano': 50000,   # J
 }
 
 
@@ -114,7 +114,7 @@ def smart_sleep(server_ip, interface="eth0", ping_timeout=15):
         logger.warning("⚠️ 设置 WoL 失败，请检查 sudo 免密权限！")
 
     # 2. 关键停顿：给驱动层缓冲时间，防止时序竞争导致系统死锁
-    time.sleep(1)
+    time.sleep(2)
 
     # 3. 执行系统挂起
     # 程序会阻塞在这里，直到被物理唤醒

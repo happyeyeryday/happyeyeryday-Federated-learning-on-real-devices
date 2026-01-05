@@ -4,6 +4,8 @@ log/
 logs/
 checkpoints/
 client_logs/
+models/SHFL/
+SHFL_model/
 
 # --- Python 通用忽略 (必须添加) ---
 __pycache__/

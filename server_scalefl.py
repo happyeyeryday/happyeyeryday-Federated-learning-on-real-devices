@@ -347,6 +347,10 @@ if __name__ == '__main__':
         while responses_received < expected_responses:
             try:
                 msg, client_idx = connectHandler.receiveData()
+                # [🔥 新增: 发送接收确认 (Upload ACK)]
+                # 告诉 Client: "我收到了，你可以睡了"
+                ack_msg = {'type': 'upload_ack'}
+                connectHandler.sendData(client_idx, ack_msg)
             except Exception as e:
                 logger.error(f"Error receiving data: {e}. Skipping.")
                 responses_received += 1

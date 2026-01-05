@@ -7,7 +7,7 @@ import argparse
 def args_parser():
     parser = argparse.ArgumentParser()
     # federated arguments
-    parser.add_argument('--epochs', type=int, default=1000, help="rounds of training")
+    parser.add_argument('--epochs', type=int, default=150, help="rounds of training")
     parser.add_argument('--num_users', type=int, default=10, help="number of users: K")
     parser.add_argument('--frac', type=float, default=0.5, help="the fraction of clients: C")
     parser.add_argument('--local_ep', type=int, default=5, help="the number of local epochs: E")
@@ -38,7 +38,7 @@ def args_parser():
     parser.add_argument('--generate_data', type=int, default=1, help="whether generate new dataset")
     parser.add_argument('--iid', type=int, default=0, help='whether i.i.d or not')
     parser.add_argument('--noniid_case', type=int, default=5, help="non i.i.d case (1, 2, 3, 4)")
-    parser.add_argument('--data_beta', type=float, default=1.0,
+    parser.add_argument('--data_beta', type=float, default=0.1,
                         help='The parameter for the dirichlet distribution for data partitioning')
     parser.add_argument('--num_classes', type=int, default=10, help="number of classes")
     parser.add_argument('--num_channels', type=int, default=3, help="number of channels of imges")
