@@ -82,8 +82,6 @@ class Three_ResNet(nn.Module):
             self.in_planes = planes * block.expansion
         return nn.Sequential(*layers)
 
-        return nn.Sequential(*layers)
-
     def _make_bottlenecklayer(self, block, num_classes, branch_layers, stride):
         layers = []
         input_planes = self.in_planes

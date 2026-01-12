@@ -115,15 +115,19 @@ class ConnectHandler(object):
         cur_length = 0
         total_data = bytes()
         pbar = tqdm(total=total_length, unit='iteration')
-        # self.socket.settimeout(60)
-        logger.info("start recving, timeout limit: 60")
+        self.socket.settimeout(10)  # [🔥 修复] 设置10秒超时，足够接收剩余数据
+        logger.info("start recving, timeout limit: 10s")
         while cur_length < total_length:
             data = self.socket.recv(min(total_length-cur_length, 1024000))
+            if not data:  # [🔥 新增] 连接断开检测
+                logger.error(f"Connection closed! Received {cur_length}/{total_length} bytes")
+                break
             cur_length += len(data)
             total_data += data
             pbar.update(len(data))
+        pbar.close()  # [🔥 新增] 确保进度条正确关闭
         logger.info("receive completed")
         total_data = pickle.loads(total_data)
-        # self.socket.settimeout(None)
+        self.socket.settimeout(None)  # [🔥 修复] 恢复阻塞模式
         logger.info("end recving, timeout limit close")
         return total_data

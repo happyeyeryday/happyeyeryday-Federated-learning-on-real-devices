@@ -5,12 +5,6 @@ import numpy as np
 import os
 from loguru import logger
 
-DEVICE_ACTION_CAPS = {
-    'nano': 2,
-    'xavier': 3,
-    'orin': 4,
-}
-
 # ==========================================
 # 1. 网络定义 (直接复用学长的代码)
 # ==========================================
@@ -176,15 +170,6 @@ class SHFLAgentManager:
                 q_values, h_out = self.eval_rnn(input_tensor, h_in)
                 
                 self.hidden_states[i] = h_out.squeeze(0)
-
-                dtype = device_types[i] # 获取当前设备的类型
-                cap = DEVICE_ACTION_CAPS.get(dtype, 2) # 默认给 Nano 的限制 (2)
-                
-                # Q-values 索引: 0->Model1, 1->Model2, 2->Model3, 3->Model4
-                # 如果 cap=2，允许索引 0, 1。屏蔽索引 2, 3。
-                if cap < 4:
-                    # 将超出上限的动作 Q 值设为负无穷
-                    q_values[0, cap:] = -float('inf')
                 
                 # [🔥 关键修改: 获取 Q 值]
                 # q_values 是一个 [1, 4] 的向量，对应 Model 1-4 的分数
@@ -206,73 +191,3 @@ class SHFLAgentManager:
                 self.last_actions[i][action] = 1.0
                 
         return client_decisions
-    # def select_models(self, observations, device_types, round_num=None):
-    #     """
-    #     根据当前观测值，返回每个 Client 的最佳动作及其 Q 值。
-    #     [🔥 修改] 增加了 device_types 参数，用于动作屏蔽
-        
-    #     Args:
-    #         observations: list of dict
-    #         device_types: list of str, 对应每个 Client 的类型 ('nano', 'orin'...)
-    #     """
-    #     if len(observations) != self.n_agents:
-    #         logger.warning(f"Observation len != Agents")
-
-    #     client_decisions = []
-        
-    #     with torch.no_grad():
-    #         for i in range(self.n_agents):
-    #             # 1. 构建输入 (保持不变)
-    #             obs_data = observations[i]
-    #             obs_vec = torch.tensor([
-    #                 obs_data['L'], obs_data['C'], obs_data['E']
-    #             ], dtype=torch.float32).to(self.device)
-                
-    #             last_act_vec = self.last_actions[i]
-                
-    #             id_vec = torch.zeros(self.n_agents).to(self.device)
-    #             # 处理 ID 映射 (物理ID -> 训练ID)
-    #             # 假设外部已经做好了映射，或者我们在这里做
-    #             # 简单起见，假设 i 就是对应的 ID (如果使用了 ID 反转，外部调用时需注意顺序)
-    #             id_idx = i % self.n_agents
-    #             id_vec[id_idx] = 1.0 
-                
-    #             input_tensor = torch.cat([obs_vec, last_act_vec, id_vec], dim=0).unsqueeze(0) 
-                
-    #             # 2. 前向传播
-    #             h_in = self.hidden_states[id_idx].unsqueeze(0)
-                
-    #             # q_values Shape: [1, 4] -> [Model1, Model2, Model3, Model4]
-    #             q_values, h_out = self.eval_rnn(input_tensor, h_in)
-                
-    #             self.hidden_states[id_idx] = h_out.squeeze(0)
-                
-    #             # ========================================================
-    #             # [🔥 核心修改: 动作屏蔽 (Action Masking)]
-    #             # ========================================================
-    #             dtype = device_types[i] # 获取当前设备的类型
-    #             cap = DEVICE_ACTION_CAPS.get(dtype, 2) # 默认给 Nano 的限制 (2)
-                
-    #             # Q-values 索引: 0->Model1, 1->Model2, 2->Model3, 3->Model4
-    #             # 如果 cap=2，允许索引 0, 1。屏蔽索引 2, 3。
-    #             if cap < 4:
-    #                 # 将超出上限的动作 Q 值设为负无穷
-    #                 q_values[0, cap:] = -float('inf')
-
-    #             # 3. 选择动作 (Argmax Q)
-    #             max_q, action_idx = torch.max(q_values, dim=1)
-                
-    #             action = action_idx.item()      # 0-3
-    #             max_q_val = max_q.item()        # 最高分数
-                
-    #             client_decisions.append({
-    #                 'client_idx': i,
-    #                 'action': action + 1,  # 0->1 (Model-1)
-    #                 'q_value': max_q_val
-    #             })
-                
-    #             # 更新 Last Action
-    #             self.last_actions[id_idx].zero_()
-    #             self.last_actions[id_idx][action] = 1.0
-                
-    #     return client_decisions

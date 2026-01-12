@@ -7,6 +7,7 @@ from loguru import logger
 import time
 import sys
 import os
+from tqdm import tqdm  # [新增] 引入 tqdm
 
 # 引入基础组件
 from utils.ConnectHandler_client import ConnectHandler
@@ -15,7 +16,7 @@ from utils.get_dataset import *
 from utils.options import args_parser
 from utils.set_seed import set_random_seed
 
-# [关键修改] 引入 SHFL 模型
+# [关键修改 1] 引入 ScaleFL 组件
 from models.SHFL_resnet import shfl_resnet18
 
 # [新增] 引入 BatteryManager 和 休眠模块
@@ -48,10 +49,10 @@ if __name__ == '__main__':
 
     # ========== [🔥 电池模拟 Step 1: 初始化] ==========
     DEVICE_TYPE_MAP = {
-        0: 'orin',
-        1: 'xavier',
-        2: 'xavier',
-        # 3-9 默认 nano
+        9: 'orin',
+        8: 'xavier',
+        7: 'xavier',
+        # 0-6 默认 nano
     }
     device_type = DEVICE_TYPE_MAP.get(args.CID, 'nano')
     battery_manager = BatteryManager(device_type=device_type)
@@ -135,6 +136,7 @@ if __name__ == '__main__':
                     # 打印一下 Keys 方便调试
                     logger.debug(f"Local keys head: {list(local_model.state_dict().keys())[:3]}")
                     logger.debug(f"Recv keys head: {list(w_local_state_dict.keys())[:3]}")
+                    continue
 
                 dtLoader = DataLoader(DatasetSplit(dataset_train, idxs_list),
                                     batch_size=args.bs, shuffle=True)
@@ -148,9 +150,15 @@ if __name__ == '__main__':
                 train_start_time = time.time()
                 epoch_loss = []
 
+                logger.info(f"Starting training for {args.local_ep} epochs...")
+
                 for epoch in range(args.local_ep):
                     batch_loss = []
-                    for batch_idx, (images, labels) in enumerate(dtLoader):
+                    
+                    # [🔥 新增] 使用 tqdm 显示进度条
+                    pbar = tqdm(dtLoader, desc=f"Epoch {epoch+1}/{args.local_ep}", unit="batch")
+                    
+                    for batch_idx, (images, labels) in enumerate(pbar):
                         images, labels = images.to(args.device), labels.to(args.device)
                         optimizer.zero_grad()
                         
@@ -162,12 +170,18 @@ if __name__ == '__main__':
                         loss.backward()
                         optimizer.step()
                         batch_loss.append(loss.item())
+                        
+                        # [🔥 新增] 更新进度条显示的 Loss
+                        pbar.set_postfix({'loss': f'{loss.item():.4f}'})
                     
-                    epoch_loss.append(sum(batch_loss)/len(batch_loss))
+                    avg_epoch_loss = sum(batch_loss)/len(batch_loss)
+                    epoch_loss.append(avg_epoch_loss)
+                    # [🔥 新增] 每个 Epoch 结束打印汇总
+                    logger.info(f"  Epoch {epoch+1} finished. Avg Loss: {avg_epoch_loss:.4f}")
 
                 train_duration = time.time() - train_start_time
                 battery_manager.consume('train', train_duration)
-                logger.info(f"Round {round_num} finished. Avg Loss: {sum(epoch_loss)/len(epoch_loss):.4f}")
+                logger.info(f"Round {round_num} finished. Total Avg Loss: {sum(epoch_loss)/len(epoch_loss):.4f}")
 
                 # ========== [状态 4: 上传数据] ==========
                 msg = dict()
