@@ -236,11 +236,11 @@ if __name__ == '__main__':
     # Orin: Rate 1.0, Full Depth (Exit 3)
     device_config_map[0] = (1.0, 3)
     # Xavier: Rate 0.5, Depth 3 (Exit 2)
-    device_config_map[1] = (0.5, 2)
-    device_config_map[2] = (0.5, 2)
+    device_config_map[1] = (1.0, 2)
+    device_config_map[2] = (1.0, 2)
     # Nano: Rate 0.25, Depth 2 (Exit 1)
     for i in range(3, 10):
-        device_config_map[i] = (0.25, 1)
+        device_config_map[i] = (1.0, 1)
 
     # 3. 全局模型配置
     global_model_config = {
@@ -306,7 +306,7 @@ if __name__ == '__main__':
             device_info_map[idx]['mac']: device_info_map[idx]['ip']
             for idx in idxs_users if idx in device_info_map
         }
-        wake_clients(mac_to_ip_to_wake, total_timeout=15)
+        wake_clients(mac_to_ip_to_wake, total_timeout=20)
 
         # 下发
         for idx in idxs_users:
@@ -347,10 +347,6 @@ if __name__ == '__main__':
         while responses_received < expected_responses:
             try:
                 msg, client_idx = connectHandler.receiveData()
-                # [🔥 新增: 发送接收确认 (Upload ACK)]
-                # 告诉 Client: "我收到了，你可以睡了"
-                ack_msg = {'type': 'upload_ack'}
-                connectHandler.sendData(client_idx, ack_msg)
             except Exception as e:
                 logger.error(f"Error receiving data: {e}. Skipping.")
                 responses_received += 1
@@ -378,8 +374,12 @@ if __name__ == '__main__':
                 logger.info(f"📥 Received model from Client {client_idx}")
                 w_local_client.append(msg['net'])
                 # ScaleFL 聚合需要知道 Rate
-                # 这里假设 msg 里回传了 rate，或者查表
                 rates_this_round.append(device_config_map[client_idx][0])
+                
+                # [🔥 关键: 接收成功后立即发送 ACK]
+                ack_msg = {'type': 'upload_ack', 'round': iter}
+                if not connectHandler.sendData(client_idx, ack_msg):
+                    logger.error(f"Failed to send ACK to client#{client_idx}")
             
             else:
                 logger.warning(f"Received unknown message from Client {client_idx}")

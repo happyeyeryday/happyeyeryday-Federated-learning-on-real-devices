@@ -49,7 +49,6 @@ class SocketPool:
         
         try:
             while total_sent < data_length:
-                # ÿ�γ��Է���ʣ�������
                 conn.send(binary_data[total_sent:min(total_sent+rate, data_length)])
                 total_sent = min(total_sent+rate, data_length)
         except OSError as e:

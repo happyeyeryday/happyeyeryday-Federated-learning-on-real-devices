@@ -93,7 +93,7 @@ if __name__ == '__main__':
                         connectHandler.uploadToServer(msg)
                         
                         # [更新电量] 发送这一小段消息也要算电量
-                        battery_manager.consume('comm', time.time() - upload_start)
+                        battery_manager.consume('communication', time.time() - upload_start)
                         
                         # 2. [新增] 等待 Server 确认 (ACK)
                         logger.info("⏳ Waiting for server confirmation to shutdown...")

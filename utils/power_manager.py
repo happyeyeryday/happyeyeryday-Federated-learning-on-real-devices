@@ -90,6 +90,22 @@ class BatteryManager:
         if not is_enough:
             logger.warning(f"🪫 [Battery] Low Level! Current: {self.current_charge:.1f} J < Threshold: {threshold} J")
         return is_enough
+    
+    def get_default_interface():
+        """
+        通过查询路由表，找到连接到 Server 的网卡接口名称 (Linux only)
+        """
+        try:
+            # 读取 /proc/net/route 文件查找默认网关
+            with open("/proc/net/route") as f:
+                for line in f.readlines():
+                    fields = line.strip().split()
+                    # 00000000 代表默认网关 (0.0.0.0)
+                    if len(fields) > 1 and fields[1] == '00000000':
+                        return fields[0] # 返回接口名，如 eth0, wlan0
+        except Exception:
+            pass
+        return "eth0" # 如果找不到，回退到默认值
 
 # ==========================================
 # Client 端使用的功能
@@ -223,3 +239,4 @@ def wake_clients(mac_to_ip_map, total_timeout):
         logger.error(f"❌ [PowerManager] 唤醒超时！以下设备未能唤醒:")
         for mac in devices_to_wake:
             logger.error(f"  - IP: {mac_to_ip_map[mac]}, MAC: {mac}")
+

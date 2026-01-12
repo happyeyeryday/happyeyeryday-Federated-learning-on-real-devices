@@ -1,7 +1,9 @@
 import time
 import copy
 import torch
+from torch import nn
 import numpy as np
+import random
 from loguru import logger
 from torch.utils.data import DataLoader
 
@@ -17,37 +19,35 @@ from utils.power_manager import wake_clients
 # [新增] 引入 SHFL 智能体
 from utils.shfl_agent import SHFLAgentManager
 
-# 引入 SHFL 模型 (基于 BYOT)
 from models.SHFL_resnet import shfl_resnet18
 
 # 全局变量
 net_glob = None
+w_local_client = []
 
 # =============================================================================
-# 1. SHFL 专用分发函数 (适配 BYOT 结构)
+# 1. SHFL 专用分发函数 (适配 BYOT 结构: mainblocks, bottlenecks, fcs)
 # =============================================================================
 def shfl_distribute(global_model_state, model_idx):
     """
     根据 model_idx (1-4) 对 BYOT 模型进行切片下发。
     
-    Model Structure:
-    - mainblocks.0, .1, .2, .3
-    - bottlenecks.0, .1, .2, .3
-    - fcs.0, .1, .2, .3
+    Args:
+        model_idx: 1 (Block0), 2 (Block0+1), 3 (Block0-2), 4 (Full)
     
-    Logic:
-    - If model_idx = 2 (Block 0+1):
-        - Send: mainblocks.0, mainblocks.1
-        - Send: bottlenecks.1 (对应的出口)
-        - Send: fcs.1 (对应的分类头)
-        - Send: conv1, bn1 (公共头部)
+    Structure to Keep:
+    - conv1, bn1: Always
+    - mainblocks.i: if i <= target_idx
+    - bottlenecks.i, fcs.i: if i <= target_idx (Client需要计算中间Loss)
     """
     if model_idx == 4:
-        # Full Model: 发送所有参数
-        return copy.deepcopy(global_model_state)
+        # Full Model: 发送所有参数 (除了 BN stats)
+        # 这里还是走一遍过滤逻辑比较安全
+        pass
     
     local_state = {}
-    target_exit_idx = model_idx - 1 # model_idx 1 -> index 0
+    # model_idx 1 -> index 0 (Block 0)
+    target_exit_idx = model_idx - 1 
     
     for k, v in global_model_state.items():
         # 过滤 BN 统计量 (sBN)
@@ -62,21 +62,21 @@ def shfl_distribute(global_model_state, model_idx):
         elif k.startswith('mainblocks'):
             # 格式: mainblocks.0.xxx
             try:
-                block_id = int(k.split('.')[1])
+                parts = k.split('.')
+                block_id = int(parts[1])
                 # 只发送 <= target_exit_idx 的块
-                # 例如 Model-2 (idx=1): 需要 Block 0, 1
                 if block_id <= target_exit_idx:
                     local_state[k] = v.clone()
             except: pass
             
         # 3. 瓶颈层与分类头 (bottlenecks, fcs)
-        # SHFL 论文通常只训练对应深度的那个出口，或者训练所有浅层出口
-        # 为了简化且符合 BYOT 逻辑，我们只下发**当前深度对应的那个出口**
         elif k.startswith('bottlenecks') or k.startswith('fcs'):
+            # 格式: bottlenecks.0.xxx
             try:
-                exit_id = int(k.split('.')[1])
-                # 只发送当前出口
-                if exit_id == target_exit_idx:
+                parts = k.split('.')
+                exit_id = int(parts[1])
+                # 发送所有 <= target 的出口 (因为 Client 会计算中间 Loss)
+                if exit_id <= target_exit_idx:
                     local_state[k] = v.clone()
             except: pass
             
@@ -87,31 +87,28 @@ def shfl_distribute(global_model_state, model_idx):
 # =============================================================================
 def shfl_aggregate(w_local_list, model_indices, net_glob):
     """
-    聚合不同深度的模型。
-    model_indices: list, 每个 Client 对应的 model_idx (1-4)
+    聚合不同深度的模型 (BYOT结构)。
     """
     global_state = net_glob.state_dict()
     sum_buffer = {}
     count_buffer = {}
     
-    # 初始化
+    # 初始化 Buffer
     for k, v in global_state.items():
         if 'num_batches_tracked' in k: continue
         sum_buffer[k] = torch.zeros_like(v, dtype=torch.float32)
         count_buffer[k] = torch.zeros_like(v, dtype=torch.float32)
 
     for idx, local_w in enumerate(w_local_list):
-        # 这里的 model_idx 暂时没用到，因为我们依靠 key 匹配
-        # 只有 Client 拥有这个 key，它才会传回来
-        
+        # 这里的 model_indices[idx] 可以用来做校验，但主要依靠 Key 匹配
         for k, v_local in local_w.items():
             if k not in sum_buffer: continue
             
-            # SHFL 不涉及宽度切片，直接全量聚合
+            # 直接累加 (不需要切片，因为 SHFL 是深度剪枝，参数维度没变，只是有的层有，有的层没有)
             sum_buffer[k] += v_local
             count_buffer[k] += 1
 
-    # 平均
+    # 平均并更新
     updated_state = {}
     for k in global_state.keys():
         if 'num_batches_tracked' in k:
@@ -127,13 +124,22 @@ def shfl_aggregate(w_local_list, model_indices, net_glob):
     return updated_state
 
 # =============================================================================
-# 3. 工具函数
+# 3. BN 校准 & 评估 (适配 BYOT)
 # =============================================================================
 def stats(dataset, model, args):
     logger.info("Starting BN calibration...")
+    # 打印数据集大小，检查 Server 是否真的持有数据
+    logger.info(f"DEBUG: Server dataset size: {len(dataset)}") 
     test_model = copy.deepcopy(model)
     test_model.to(args.device)
+
+    # 打印校准前的 BN 均值（抽查第一层）
+    for name, module in test_model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            logger.info(f"DEBUG: Before Calib - {name} mean head: {module.running_mean[:5].tolist()}")
+            break
     
+    # 强制所有 BN 层进入追踪模式
     for module in test_model.modules():
         if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
             if module.track_running_stats:
@@ -144,10 +150,16 @@ def stats(dataset, model, args):
     data_loader = DataLoader(dataset, batch_size=args.bs, shuffle=True, drop_last=True)
     with torch.no_grad():
         for i, (images, _) in enumerate(data_loader):
-            if i >= 50: break
+            if i >= 50: break 
             images = images.to(args.device)
-            # BYOT 模型返回 (output, features...)，我们不需要返回值
+            # BYOT Forward 返回 tuple/list，跑通即可
             _ = test_model(images)
+
+    # 打印校准后的 BN 均值
+    for name, module in test_model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            logger.info(f"DEBUG: After Calib  - {name} mean head: {module.running_mean[:5].tolist()}")
+            break
     
     test_model.eval()
     logger.info("✅ BN calibration finished.")
@@ -160,14 +172,16 @@ def summary_evaluate(net, dataset_test, device):
     with torch.no_grad():
         for images, labels in dtLoader:
             images, labels = images.to(device), labels.to(device)
-            # BYOT Forward 返回: output(list), features, embedding
-            # 对应的 output 是 [logits_1, logits_2, logits_3, logits_4]
-            # SHFL 评估通常看最深层出口 (Model-4)
-            # 注意：如果网络结构被裁剪了，这里可能会报错，但在 Server 端我们用的是完整的 net_glob
+            # BYOT Forward: output(list), features, embedding
+            # 我们取 output 列表中的最后一个 (Full Model Prediction)
             outputs = net(images) 
-            # 兼容性处理：如果返回 tuple/list
+            
+            # 兼容性处理
             if isinstance(outputs, (tuple, list)):
-                final_pred = outputs[-1] # 取最后一个出口的 logits
+                # outputs[0] 是 logits 列表
+                # outputs[0][-1] 是最深层的 logits
+                logits_list = outputs[0] if isinstance(outputs[0], (list, tuple)) else outputs
+                final_pred = logits_list[-1]
             else:
                 final_pred = outputs
 
@@ -185,63 +199,65 @@ if __name__ == '__main__':
     args = args_parser()
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
 
-    # 1. 设备配置 (MAC & IP)
+    # 1. 设备配置
     device_info_map = {
-        0: {'mac': "3c:6d:66:28:57:90", 'ip': "192.168.31.19", 'type': 'orin'}, 
-        1: {'mac': "48:b0:2d:2f:e2:d9", 'ip': "192.168.31.243", 'type': 'xavier'}, 
-        2: {'mac': "48:b0:2d:2f:eb:0e", 'ip': "192.168.31.198", 'type': 'xavier'}, 
-        3: {'mac': "48:b0:2d:3c:cc:df", 'ip': "192.168.31.121", 'type': 'nano'}, 
-        4: {'mac': "48:b0:2d:3c:ca:27", 'ip': "192.168.31.237", 'type': 'nano'}, 
-        5: {'mac': "48:b0:2d:3c:ca:20", 'ip': "192.168.31.231", 'type': 'nano'}, 
-        6: {'mac': "48:b0:2d:3c:ca:2e", 'ip': "192.168.31.244", 'type': 'nano'}, 
-        7: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.154", 'type': 'nano'}, 
-        8: {'mac': "48:b0:2d:3c:ca:18", 'ip': "192.168.31.239", 'type': 'nano'}, 
-        9: {'mac': "48:b0:2d:3c:cc:f3", 'ip': "192.168.31.142", 'type': 'nano'}, 
-    }
-    
-    # 2. 硬件能力配置 (用于 RL State: [L, C, E])
-    # 归一化常数
-    MAX_COMPUTE = 1.0 # Orin=1.0
-    MAX_ENERGY = 100000.0 # Orin Max J
-    
-    # 设备算力表 (C)
-    COMPUTE_CAPABILITY = {
-        'orin': 1.0,
-        'xavier': 0.5,
-        'nano': 0.25
+        0: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.154"}, # Nano
+        1: {'mac': "48:b0:2d:3c:ca:18", 'ip': "192.168.31.239"}, # Nano
+        2: {'mac': "48:b0:2d:3c:cc:f3", 'ip': "192.168.31.142"}, # Nano
+        3: {'mac': "48:b0:2d:3c:cc:df", 'ip': "192.168.31.121"}, # Nano
+        4: {'mac': "48:b0:2d:3c:ca:27", 'ip': "192.168.31.237"}, # Nano
+        5: {'mac': "48:b0:2d:3c:ca:20", 'ip': "192.168.31.231"}, # Nano
+        6: {'mac': "48:b0:2d:3c:ca:2e", 'ip': "192.168.31.244"}, # Nano
+        7: {'mac': "48:b0:2d:2f:eb:0e", 'ip': "192.168.31.198"}, # Xavier
+        8: {'mac': "48:b0:2d:2f:e2:d9", 'ip': "192.168.31.243"}, # Xavier
+        9: {'mac': "3c:6d:66:28:57:90", 'ip': "192.168.31.19"}, # Orin
     }
     
     num_physical_clients = len(device_info_map)
     active_clients = list(range(num_physical_clients))
+
+    # 2. 硬件能力配置 (C)
+    COMPUTE_CAPABILITY = {
+        'orin': 1.0,
+        'xavier': 0.55,
+        'nano': 0.076 
+    }
     
-    # 3. 维护每个 Client 的当前状态 (L, C, E)
-    # 初始化电量满电
+    # 3. 初始化 Client 状态
     client_states = {}
-    for idx, info in device_info_map.items():
-        client_states[idx] = {
-            'C': COMPUTE_CAPABILITY[info['type']],
-            'E': 1.0, # 归一化电量 (Current / Max)
-            # L (数据量) 在 get_dataset 后填充
+    # 定义 ID 到类型的映射，方便查表
+    # 0=Orin, 1-2=Xavier, 3-9=Nano
+    id_to_type = {}
+    for i in range(args.num_users):
+        if i == 9: t = 'orin'
+        elif i == 8 or i == 7: t = 'xavier'
+        else: t = 'nano'
+        id_to_type[i] = t
+        
+        client_states[i] = {
+            'C': COMPUTE_CAPABILITY[t],
+            'E': 1.0, 
+            'L': 0.0 # 稍后填充
         }
 
     # ================= [初始化] =================
     set_random_seed(args.seed)
     dataset_train, dataset_test, dict_users = get_dataset(args)
     
-    # 填充 L (数据量)
+    # 填充 L
     max_data_len = max([len(dict_users[i]) for i in range(num_physical_clients)])
     for idx in client_states:
         client_states[idx]['L'] = len(dict_users[idx]) / max_data_len
 
     logger.info("Initializing SHFL Global Model (BYOT)...")
+    # [🔥 修正] 使用 shfl_resnet18 工厂函数
     net_glob = shfl_resnet18(num_classes=args.num_classes)
     net_glob.apply(init_weights)
     net_glob.to(args.device)
     
     # ================= [RL Agent 初始化] =================
-    # 注意：这里的 model_dir 指向存放 .pkl 的目录
     try:
-        rl_agent = SHFLAgentManager(real_n_agents=num_physical_clients, model_dir='./models/SHFL')
+        rl_agent = SHFLAgentManager(n_agents=num_physical_clients, model_dir='./SHFL_model/')
         logger.success("RL Agent initialized successfully.")
     except Exception as e:
         logger.error(f"Failed to init RL Agent: {e}")
@@ -253,72 +269,72 @@ if __name__ == '__main__':
     logger.info(f"🔌 Server listening for {num_physical_clients} clients...")
     connectHandler = ConnectHandler(num_physical_clients, args.HOST, args.POST)
 
+    target_m = max(int(args.frac * num_physical_clients), 1)
+
     # ================= [训练循环] =================
     for iter in range(args.epochs):
         if not active_clients:
             logger.critical("🪫 All clients have run out of battery.")
             break
             
-        logger.info(f"🔋 Active Clients Pool: {active_clients} (Total: {len(active_clients)})")
+        logger.info(f"🔋 Active Clients Pool: {len(active_clients)}")
+        current_m = min(target_m, len(active_clients))
         
-        # 1. 准备 RL 输入状态
-        # 需要构建一个 list, 顺序对应 Client 0, 1, 2...
+        # 1. 准备 RL 输入
         observations = []
+        device_types = []
         for i in range(num_physical_clients):
-            # 即使 client 不活跃，也要占位 (RL 需要固定维度输入)
-            # 不活跃的 client 电量可以设为 0
             if i in active_clients:
                 observations.append(client_states[i])
             else:
-                dead_state = client_states[i].copy()
-                dead_state['E'] = 0.0
-                observations.append(dead_state)
+                # 死亡设备
+                dead = client_states[i].copy()
+                dead['E'] = 0.0
+                observations.append(dead)
+            # 添加设备类型信息
+            device_types.append(id_to_type[i])
         
-        # 2. RL 决策 (Dual-Selection)
-        # actions: list of int (0=不选, 1-4=Model1-4)
-        actions = rl_agent.select_models(observations, round_num=iter)
+        # 2. RL 决策 (传入设备类型)
+        decisions = rl_agent.select_models(observations, device_types, round_num=iter)
         
-        # 解析选中的 Clients
+        # 3. Top-K 筛选
+        valid_decisions = [d for d in decisions if d['client_idx'] in active_clients]
+        valid_decisions.sort(key=lambda x: x['q_value'], reverse=True)
+        top_k = valid_decisions[:current_m]
+        
         idxs_users = []
-        client_model_map = {} # ID -> Model_Idx
-        
-        for idx, action in enumerate(actions):
-            if idx in active_clients and action > 0: # action > 0 意味着被选中
-                idxs_users.append(idx)
-                client_model_map[idx] = action
-        
-        # 转换为 numpy 数组以兼容后续代码
+        client_model_map = {}
+        for d in top_k:
+            c_idx = d['client_idx']
+            idxs_users.append(c_idx)
+            client_model_map[c_idx] = d['action'] # Model 1-4
+
         idxs_users = np.array(idxs_users)
         
         print(f"\n{'='*60}")
-        print(f"Round {iter}: RL Selected {len(idxs_users)} Clients")
+        print(f"Round {iter}: RL Top-{current_m}")
         print(f"Selection: {idxs_users}")
         print(f"Models: {[client_model_map[i] for i in idxs_users]}")
         print(f"{'='*60}\n")
-        
-        if len(idxs_users) == 0:
-            logger.warning("RL Agent selected NO clients this round! Skipping...")
-            time.sleep(2)
-            continue
 
-        # 3. 唤醒
+        # 4. 唤醒
         mac_to_ip_to_wake = {
             device_info_map[idx]['mac']: device_info_map[idx]['ip']
             for idx in idxs_users
         }
         wake_clients(mac_to_ip_to_wake, total_timeout=15)
 
-        # 4. 下发
+        # 5. 下发
         successful_indices = []
         for idx in idxs_users:
             model_idx = client_model_map[idx]
             
             msg = dict()
-            # 调用 SHFL 切片函数
+            # [🔥 修正] 使用 shfl_distribute
             w_local_slice = shfl_distribute(net_glob.state_dict(), model_idx)
             
             msg['net'] = w_local_slice
-            msg['model_idx'] = model_idx # 告诉 Client 跑哪个 Model (1-4)
+            msg['model_idx'] = model_idx
             msg['idxs_list'] = dict_users[idx]
             msg['type'] = 'net'
             msg['round'] = iter
@@ -328,11 +344,10 @@ if __name__ == '__main__':
             if connectHandler.sendData(idx, msg):
                 successful_indices.append(idx)
             else:
-                logger.error(f"❌ Failed to send to Client {idx}.")
-                if idx in active_clients:
-                    active_clients.remove(idx)
+                logger.error(f"❌ Failed to send to Client {idx}. Removing.")
+                if idx in active_clients: active_clients.remove(idx)
 
-        # 5. 接收
+        # 6. 接收
         w_local_client = []
         model_indices_this_round = []
         
@@ -348,11 +363,7 @@ if __name__ == '__main__':
                 continue
             responses_received += 1
             
-            # [更新电量状态]
             if 'battery_level' in msg:
-                 # 假设 Client 回传的是剩余 Wh 或 J，这里再次归一化
-                 # 简单起见，Client 直接回传剩余百分比 (0.0-1.0) 最方便
-                 # 或者 Server 自己估算。这里假设 msg['battery_level'] 是 0-1
                  client_states[client_idx]['E'] = msg['battery_level']
             
             if msg['type'] == 'status' and msg.get('status') == 'low_battery':
@@ -360,23 +371,22 @@ if __name__ == '__main__':
                 connectHandler.sendData(client_idx, {'type': 'shutdown_ack'})
                 if client_idx in active_clients:
                     active_clients.remove(client_idx)
-                    client_states[client_idx]['E'] = 0.0 # 标记为死
+                    client_states[client_idx]['E'] = 0.0
 
             elif msg['type'] == 'net':
                 logger.info(f"📥 Received from Client {client_idx}")
                 w_local_client.append(msg['net'])
                 model_indices_this_round.append(client_model_map[client_idx])
-                
-                # 发送 ACK (保持一致性)
                 connectHandler.sendData(client_idx, {'type': 'upload_ack'})
 
-        # 6. 聚合
+        # 7. 聚合
         if len(w_local_client) > 0:
             logger.info(f"⚙️ Aggregating {len(w_local_client)} models...")
+            # [🔥 修正] 使用 shfl_aggregate
             w_glob = shfl_aggregate(w_local_client, model_indices_this_round, net_glob)
             net_glob.load_state_dict(w_glob, strict=False)
         
-        # 7. 校准与评估
+        # 8. 校准与评估
         net_glob_calibrated = stats(dataset_train, net_glob, args)
         net_glob.load_state_dict(net_glob_calibrated.state_dict(), strict=False)
         

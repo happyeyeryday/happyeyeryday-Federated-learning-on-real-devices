@@ -24,8 +24,8 @@ import threading
 from loguru import logger
 
 net_glob = None
-Reuse_ratio = 2
-num_device = 0
+Reuse_ratio = 1
+num_device = 10
 w_local_client = []
 
 
@@ -62,19 +62,19 @@ if __name__ == '__main__':
 
     set_random_seed(args.seed)
     dataset_train, dataset_test, dict_users = get_dataset(args)
-    if args.algorithm in ['FedAvg']:
-        if 'resnet18' in args.model:
+    # if args.algorithm in ['FedAvg']:
+    if 'resnet18' in args.model:
             net_glob = ResNet18_entire()
             net_glob.apply(init_weights)
             net_glob.to(args.device)
-        if 'vgg' in args.model:
-            net_glob = VGG16_entire()
-            net_glob.apply(init_weights)
-            net_glob.to(args.device)
-        if 'resnet8' in args.model:
-            net_glob = ResNet8_entire()
-            net_glob.apply(init_weights)
-            net_glob.to(args.device)
+        # if 'vgg' in args.model:
+        #     net_glob = VGG16_entire()
+        #     net_glob.apply(init_weights)
+        #     net_glob.to(args.device)
+        # if 'resnet8' in args.model:
+        #     net_glob = ResNet8_entire()
+        #     net_glob.apply(init_weights)
+        #     net_glob.to(args.device)
     summary_acc_test_collect = []
     time_collect = []
     if torch.cuda.is_available():

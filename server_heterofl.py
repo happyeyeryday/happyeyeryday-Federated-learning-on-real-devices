@@ -339,7 +339,7 @@ if __name__ == '__main__':
             device_info_map[idx]['mac']: device_info_map[idx]['ip']
             for idx in idxs_users if idx in device_info_map
         }
-        wake_clients(mac_to_ip_to_wake, total_timeout=10) # 唤醒超时适当放宽
+        wake_clients(mac_to_ip_to_wake, total_timeout=20) # 唤醒超时适当放宽
 
         # 下发模型
         for idx in idxs_users:

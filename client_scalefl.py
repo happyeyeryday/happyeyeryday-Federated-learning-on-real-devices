@@ -154,7 +154,7 @@ if __name__ == '__main__':
                     else:
                         logger.warning("⚠️ No ACK received or unknown message, forcing shutdown.")
                     
-                    # 3. 退出脚本 (模拟自动关机)
+                    # 3. 退出脚本 
                     os.system("sudo poweroff")
                     break
 

@@ -371,10 +371,14 @@ def _10_1_ResNet18_byot(n_models):  # (pretrained=False, **kwargs):
 def ResNet50_byot(pretrained=False, **kwargs):
     return Three_ResNet(Bottleneck, [3, 4, 6, 3], branch_layers=[[1, 1], [1]], **kwargs)
 
-def shfl_resnet18(num_classes=10):
+def shfl_resnet18(num_classes=10, model_idx=None):
     """
     SHFL 论文使用的 ResNet18 (基于 BYOT 结构)
     默认配置: 4 个分支 (Model-1 to Model-4)
+    
+    Args:
+        num_classes: 分类数量
+        model_idx: 模型深度索引 (1-4)，如果为None则返回完整模型
     """
     # 对应论文配置: Model-1~4
     # Block0 -> Exit0 (Model-1)
@@ -386,6 +390,11 @@ def shfl_resnet18(num_classes=10):
     # 原始代码 _10_3_ResNet18_byot 用的是 [3, 2, 1, 0]
     # 我们直接复用它
     
+    # 如果指定了model_idx，返回对应深度的模型
+    if model_idx is not None:
+        return _10_3_ResNet18_byot(n_models=model_idx)
+    
+    # 否则返回完整模型（用于Server端全局模型）
     return _10_3_ResNet18_byot(n_models=4) 
 
 
