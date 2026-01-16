@@ -6,6 +6,7 @@ import numpy as np
 import random
 from loguru import logger
 from torch.utils.data import DataLoader
+import datetime
 
 # 引入工具类
 from utils.ConnectHandler_server import ConnectHandler
@@ -30,7 +31,10 @@ w_local_client = []
 # =============================================================================
 def shfl_distribute(global_model_state, model_idx):
     """
-    根据 model_idx (1-4) 对 BYOT 模型进行切片下发。
+    从Server全局模型(Three_ResNet_ALL)切片下发到Client(Three_ResNet)。
+    
+    关键：Server有bottlenecks[0-3]和fcs[0-3]，Client只有bottleneck和fc
+    需要将bottlenecks.{model_idx-1}.xxx重命名为bottleneck.xxx
     
     Args:
         model_idx: 1 (Block0), 2 (Block0+1), 3 (Block0-2), 4 (Full)
@@ -38,16 +42,11 @@ def shfl_distribute(global_model_state, model_idx):
     Structure to Keep:
     - conv1, bn1: Always
     - mainblocks.i: if i <= target_idx
-    - bottlenecks.i, fcs.i: if i <= target_idx (Client需要计算中间Loss)
+    - bottlenecks.target_idx -> bottleneck (重命名)
+    - fcs.target_idx -> fc (重命名)
     """
-    if model_idx == 4:
-        # Full Model: 发送所有参数 (除了 BN stats)
-        # 这里还是走一遍过滤逻辑比较安全
-        pass
-    
     local_state = {}
-    # model_idx 1 -> index 0 (Block 0)
-    target_exit_idx = model_idx - 1 
+    target_exit_idx = model_idx - 1  # model_idx 1 -> exit_idx 0
     
     for k, v in global_model_state.items():
         # 过滤 BN 统计量 (sBN)
@@ -69,15 +68,30 @@ def shfl_distribute(global_model_state, model_idx):
                     local_state[k] = v.clone()
             except: pass
             
-        # 3. 瓶颈层与分类头 (bottlenecks, fcs)
-        elif k.startswith('bottlenecks') or k.startswith('fcs'):
-            # 格式: bottlenecks.0.xxx
+        # 3. 瓶颈层 (bottlenecks.i -> bottleneck)
+        elif k.startswith('bottlenecks'):
+            # 格式: bottlenecks.0.conv1.weight
             try:
                 parts = k.split('.')
                 exit_id = int(parts[1])
-                # 发送所有 <= target 的出口 (因为 Client 会计算中间 Loss)
-                if exit_id <= target_exit_idx:
-                    local_state[k] = v.clone()
+                # 只取当前模型对应的exit
+                if exit_id == target_exit_idx:
+                    # 重命名: bottlenecks.0.xxx -> bottleneck.xxx
+                    new_key = 'bottleneck.' + '.'.join(parts[2:])
+                    local_state[new_key] = v.clone()
+            except: pass
+            
+        # 4. 分类头 (fcs.i -> fc)
+        elif k.startswith('fcs'):
+            # 格式: fcs.0.weight
+            try:
+                parts = k.split('.')
+                exit_id = int(parts[1])
+                # 只取当前模型对应的exit
+                if exit_id == target_exit_idx:
+                    # 重命名: fcs.0.weight -> fc.weight
+                    new_key = 'fc.' + '.'.join(parts[2:])
+                    local_state[new_key] = v.clone()
             except: pass
             
     return local_state
@@ -87,7 +101,15 @@ def shfl_distribute(global_model_state, model_idx):
 # =============================================================================
 def shfl_aggregate(w_local_list, model_indices, net_glob):
     """
-    聚合不同深度的模型 (BYOT结构)。
+    聚合不同深度的模型到Server全局模型(Three_ResNet_ALL)。
+    
+    关键：Client返回的是bottleneck.xxx和fc.xxx，需要重命名为bottlenecks.{exit_idx}.xxx
+    不同深度的Client更新不同的exit，互不冲突。
+    
+    Args:
+        w_local_list: Client参数列表
+        model_indices: 每个Client使用的model_idx (1-4)
+        net_glob: Server全局模型
     """
     global_state = net_glob.state_dict()
     sum_buffer = {}
@@ -100,19 +122,34 @@ def shfl_aggregate(w_local_list, model_indices, net_glob):
         count_buffer[k] = torch.zeros_like(v, dtype=torch.float32)
 
     for idx, local_w in enumerate(w_local_list):
-        # 这里的 model_indices[idx] 可以用来做校验，但主要依靠 Key 匹配
-        for k, v_local in local_w.items():
-            if k not in sum_buffer: continue
+        model_idx = model_indices[idx]
+        exit_idx = model_idx - 1  # 1->0, 2->1, 3->2, 4->3
+        
+        for k_local, v_local in local_w.items():
+            # 反向重命名: bottleneck.xxx -> bottlenecks.{exit_idx}.xxx
+            if k_local.startswith('bottleneck.'):
+                suffix = k_local[len('bottleneck.'):]  # 去掉前缀
+                k_global = f'bottlenecks.{exit_idx}.{suffix}'
+            # 反向重命名: fc.xxx -> fcs.{exit_idx}.xxx
+            elif k_local.startswith('fc.'):
+                suffix = k_local[len('fc.'):]
+                k_global = f'fcs.{exit_idx}.{suffix}'
+            # 其他key保持不变 (conv1, bn1, mainblocks)
+            else:
+                k_global = k_local
             
-            # 直接累加 (不需要切片，因为 SHFL 是深度剪枝，参数维度没变，只是有的层有，有的层没有)
-            sum_buffer[k] += v_local
-            count_buffer[k] += 1
+            if k_global not in sum_buffer: 
+                continue
+            
+            # 累加到对应的全局参数
+            sum_buffer[k_global] += v_local
+            count_buffer[k_global] += 1
 
     # 平均并更新
     updated_state = {}
     for k in global_state.keys():
         if 'num_batches_tracked' in k:
-            updated_state[k] = sum_buffer.get(k, global_state[k]) # 保持原样
+            updated_state[k] = global_state[k]  # BN统计量不聚合
             continue
             
         mask = count_buffer[k] > 0
@@ -139,16 +176,16 @@ def stats(dataset, model, args):
             logger.info(f"DEBUG: Before Calib - {name} mean head: {module.running_mean[:5].tolist()}")
             break
     
-    # 强制所有 BN 层进入追踪模式
+    # 强制所有 BN 层进入追踪模式并重置统计量
+    test_model.train()  # 🔥 关键：必须设置为train模式
     for module in test_model.modules():
         if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-            if module.track_running_stats:
-                module.reset_running_stats()
+            module.reset_running_stats()  # 重置统计量
             module.track_running_stats = True
-            module.training = True 
+            module.momentum = None  # 🔥 关键：使用累积平均而非指数移动平均
 
     data_loader = DataLoader(dataset, batch_size=args.bs, shuffle=True, drop_last=True)
-    with torch.no_grad():
+    with torch.no_grad():  # 不需要梯度，但BN统计量仍会更新
         for i, (images, _) in enumerate(data_loader):
             if i >= 50: break 
             images = images.to(args.device)
@@ -172,17 +209,16 @@ def summary_evaluate(net, dataset_test, device):
     with torch.no_grad():
         for images, labels in dtLoader:
             images, labels = images.to(device), labels.to(device)
-            # BYOT Forward: output(list), features, embedding
-            # 我们取 output 列表中的最后一个 (Full Model Prediction)
+            # Three_ResNet_ALL Forward: (output_list, features_end, embedding)
             outputs = net(images) 
             
-            # 兼容性处理
-            if isinstance(outputs, (tuple, list)):
-                # outputs[0] 是 logits 列表
-                # outputs[0][-1] 是最深层的 logits
-                logits_list = outputs[0] if isinstance(outputs[0], (list, tuple)) else outputs
-                final_pred = logits_list[-1]
+            # Three_ResNet_ALL返回tuple: (output[0-3], features_end, embedding)
+            # output[3]是Model-4的logits（最深层）
+            if isinstance(outputs, tuple):
+                logits_list = outputs[0]  # 第一个元素是输出列表
+                final_pred = logits_list[-1]  # 取最后一个exit(Model-4)
             else:
+                # 兼容Three_ResNet（不应该走到这里，但保留以防万一）
                 final_pred = outputs
 
             metric.add(accuracy(final_pred, labels), labels.numel())
@@ -208,8 +244,8 @@ if __name__ == '__main__':
         4: {'mac': "48:b0:2d:3c:ca:27", 'ip': "192.168.31.237"}, # Nano
         5: {'mac': "48:b0:2d:3c:ca:20", 'ip': "192.168.31.231"}, # Nano
         6: {'mac': "48:b0:2d:3c:ca:2e", 'ip': "192.168.31.244"}, # Nano
-        7: {'mac': "48:b0:2d:2f:eb:0e", 'ip': "192.168.31.198"}, # Xavier
-        8: {'mac': "48:b0:2d:2f:e2:d9", 'ip': "192.168.31.243"}, # Xavier
+        7: {'mac': "48:b0:2d:2f:e2:d9", 'ip': "192.168.31.243"}, # Xavier
+        8: {'mac': "48:b0:2d:2f:eb:0e", 'ip': "192.168.31.198"}, # Xavier
         9: {'mac': "3c:6d:66:28:57:90", 'ip': "192.168.31.19"}, # Orin
     }
     
@@ -255,6 +291,16 @@ if __name__ == '__main__':
     net_glob.apply(init_weights)
     net_glob.to(args.device)
     
+    # [DEBUG] 打印模型的key结构
+    logger.info("=" * 60)
+    logger.info("Global Model Keys:")
+    for k in list(net_glob.state_dict().keys())[:10]:
+        logger.info(f"  {k}")
+    logger.info("  ...")
+    for k in list(net_glob.state_dict().keys())[-5:]:
+        logger.info(f"  {k}")
+    logger.info("=" * 60)
+    
     # ================= [RL Agent 初始化] =================
     try:
         rl_agent = SHFLAgentManager(n_agents=num_physical_clients, model_dir='./SHFL_model/')
@@ -273,12 +319,18 @@ if __name__ == '__main__':
 
     # ================= [训练循环] =================
     for iter in range(args.epochs):
+        # 记录本轮开始时间
+        round_start_time = datetime.datetime.now()
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🕐 Round {iter} Start Time: {round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+        logger.info(f"{'='*60}")
+        
         if not active_clients:
             logger.critical("🪫 All clients have run out of battery.")
             break
             
         logger.info(f"🔋 Active Clients Pool: {len(active_clients)}")
-        current_m = min(target_m, len(active_clients))
+        current_m = min(target_m, len(active_clients))    
         
         # 1. 准备 RL 输入
         observations = []
@@ -393,8 +445,16 @@ if __name__ == '__main__':
         acc = summary_evaluate(net_glob, dataset_test, args.device) * 100
         summary_acc_test_collect.append(acc)
         
+        # 记录本轮结束时间和持续时长
+        round_end_time = datetime.datetime.now()
+        round_duration = (round_end_time - round_start_time).total_seconds()
+        
         print("\n" + "="*60)
         print(f"📊 Round {iter}: Global Acc = {acc:.2f}%")
+        print(f"🕐 Round Duration: {round_duration:.2f}s")
         print("="*60 + "\n")
+        
+        # 输出CSV格式数据，方便后续分析
+        logger.info(f"RESULT_CSV,{iter},{acc:.2f},{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
 
     save_result(summary_acc_test_collect, 'shfl_acc', args)

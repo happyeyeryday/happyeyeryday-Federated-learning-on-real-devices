@@ -47,13 +47,9 @@ def get_dataset(args):
         trans_cifar10_val = transforms.Compose([transforms.ToTensor(),
                                                 transforms.Normalize(mean=[0.491, 0.482, 0.447],
                                                                      std=[0.247, 0.243, 0.262])])
-        trans = transforms.Compose([
-            transforms.Resize((32, 32)),
-            transforms.ToTensor()
-        ])
 
-        dataset_train = datasets.CIFAR10('./data/cifar10', train=True, download=True, transform=trans)
-        dataset_test = datasets.CIFAR10('./data/cifar10', train=False, download=True, transform=trans)
+        dataset_train = datasets.CIFAR10('./data/cifar10', train=True, download=True, transform=trans_cifar10_train)
+        dataset_test = datasets.CIFAR10('./data/cifar10', train=False, download=True, transform=trans_cifar10_val)
         if args.generate_data:
             if args.iid:
                 dict_users = cifar_iid(dataset_train, args.num_users)

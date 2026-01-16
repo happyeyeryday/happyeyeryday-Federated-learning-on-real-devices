@@ -168,6 +168,10 @@ if __name__ == '__main__':
                         
                         loss = loss_func(output, labels)
                         loss.backward()
+                        
+                        # [🔥 梯度裁剪] 防止极端non-IID导致的梯度爆炸
+                        torch.nn.utils.clip_grad_norm_(local_model.parameters(), max_norm=1.0)
+                        
                         optimizer.step()
                         batch_loss.append(loss.item())
                         
