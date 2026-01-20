@@ -10,7 +10,7 @@ from .scalefl_modelutils import Scaler, conv3x3
 
 
 class Classifier(nn.Module):
-    def __init__(self, in_planes, num_classes, num_conv_layers=3, reduction=1, scale=1.):
+    def __init__(self, in_planes, num_classes, num_conv_layers=3, reduction=1, scale=1., trs=True):
         super(Classifier, self).__init__()
 
         self.in_planes = in_planes
@@ -31,7 +31,9 @@ class Classifier(nn.Module):
             in_planes = int(in_planes/reduction)
             conv_list.extend([conv3x3(in_planes, in_planes) for _ in range(num_conv_layers-1)])
 
-        bn_list = [nn.BatchNorm2d(in_planes, track_running_stats=False) for _ in range(num_conv_layers)]
+        # 🔥 致命 Bug 修复: track_running_stats=False 导致推理时统计量不稳定
+        # 改为 track_running_stats=trs (默认 True)，与 BasicBlock 保持一致
+        bn_list = [nn.BatchNorm2d(in_planes, track_running_stats=trs) for _ in range(num_conv_layers)]
         relu_list = [nn.ReLU() for _ in range(num_conv_layers)]
         avg_pool = nn.AdaptiveAvgPool2d((1, 1))
         flatten = nn.Flatten()
@@ -132,7 +134,7 @@ class ResNet(nn.Module):
         else: factor = 1
 
         self.scale = scale
-        self.in_planes = int(16 * scale * factor)
+        self.in_planes = int(64 * scale * factor)
         self.num_blocks = len(ee_layer_locations) + 1
         self.num_classes = num_classes
         self.trs = trs
@@ -156,10 +158,10 @@ class ResNet(nn.Module):
             self.conv1 = nn.Conv2d(3, self.in_planes, kernel_size=3, stride=1, padding=1, bias=False)
         self.bn1 = nn.BatchNorm2d(self.in_planes, track_running_stats=self.trs)
 
-        # 2. 构建 Layers
+        # 2. 构建 Layers (通道数统一为 [64, 128, 256, 512])
         
         # Layer 1 (Block 0): 肯定有
-        layer1, ee1 = self._make_layer(block, int(16 * scale), layers[0], stride=1,
+        layer1, ee1 = self._make_layer(block, int(64 * scale), layers[0], stride=1,
                                        ee_layer_locations=[l for i, l in enumerate(ee_layer_list) if ee_block_list[i] == 0])
         
         self.layers = nn.ModuleList([layer1])
@@ -167,29 +169,29 @@ class ResNet(nn.Module):
 
         # Layer 2 (Block 1): 如果有
         if len(layers) > 1:
-            layer2, ee2 = self._make_layer(block, int(32 * scale), layers[1], stride=2,
+            layer2, ee2 = self._make_layer(block, int(128 * scale), layers[1], stride=2,
                                            ee_layer_locations=[l for i, l in enumerate(ee_layer_list) if ee_block_list[i] == 1])
             self.layers.append(layer2)
             self.ee_classifiers.append(ee2)
 
         # [🔥 修复 Nano 崩溃] Layer 3 (Block 2): 必须检查是否存在
         if len(layers) > 2:
-            layer3, ee3 = self._make_layer(block, int(64 * scale), layers[2], stride=2,
+            layer3, ee3 = self._make_layer(block, int(256 * scale), layers[2], stride=2,
                                            ee_layer_locations=[l for i, l in enumerate(ee_layer_list) if ee_block_list[i] == 2])
             self.layers.append(layer3)
             self.ee_classifiers.append(ee3)
 
         # Layer 4 (Block 3): 必须检查是否存在
         if len(layers) > 3:
-            layer4, ee4 = self._make_layer(block, int(128 * scale), layers[3], stride=2,
+            layer4, ee4 = self._make_layer(block, int(512 * scale), layers[3], stride=2,
                                            ee_layer_locations=[l for i, l in enumerate(ee_layer_list) if ee_block_list[i] == 3])
             self.layers.append(layer4)
             self.ee_classifiers.append(ee4)
 
         # 3. 构建 Linear
         if self.is_full_model:
-            # 动态计算 Linear 输入维度
-            final_planes = int(16 * (2**(len(self.layers)-1)) * scale) * block.expansion
+            # 动态计算 Linear 输入维度 (基础通道64，每层*2)
+            final_planes = int(64 * (2**(len(self.layers)-1)) * scale) * block.expansion
             self.linear = nn.Linear(final_planes, num_classes)
         else:
             pass
@@ -215,7 +217,7 @@ class ResNet(nn.Module):
 
                 if i < len(ee_layer_locations_) - 1:
                     ee_classifiers.append(Classifier(num_planes, num_classes=self.num_classes,
-                                                     reduction=block_type.expansion, scale=self.scale))
+                                                     reduction=block_type.expansion, scale=self.scale, trs=self.trs))
         else:
             for i in range(num_block):
                 layers[0].append(block_type(self.in_planes, planes, strides[i], trs=self.trs, scale=self.scale))

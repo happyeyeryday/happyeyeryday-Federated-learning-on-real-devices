@@ -17,9 +17,6 @@ from utils.set_seed import set_random_seed
 from utils.utils import save_result
 from utils.power_manager import wake_clients
 
-# [新增] 引入 SHFL 智能体
-from utils.shfl_agent import SHFLAgentManager
-
 from models.SHFL_resnet import shfl_resnet18
 
 # 全局变量
@@ -301,14 +298,11 @@ if __name__ == '__main__':
         logger.info(f"  {k}")
     logger.info("=" * 60)
     
-    # ================= [RL Agent 初始化] =================
-    try:
-        rl_agent = SHFLAgentManager(n_agents=num_physical_clients, model_dir='./SHFL_model/')
-        logger.success("RL Agent initialized successfully.")
-    except Exception as e:
-        logger.error(f"Failed to init RL Agent: {e}")
-        exit(1)
-
+    logger.info("HeteroFL Baseline Mode: Random Client Selection with Fixed Model Assignment")
+    logger.info("  - Nano (0-6): Model-1")
+    logger.info("  - Xavier (7-8): Random Model-3 or Model-4")
+    logger.info("  - Orin (9): Model-4")
+    
     summary_acc_test_collect = []
     time_collect = []
     
@@ -321,7 +315,7 @@ if __name__ == '__main__':
     # [新增] 断点续训 - 加载 Checkpoint
     # ==========================================
     import os
-    checkpoint_path = "checkpoint_shfl.pth"
+    checkpoint_path = "checkpoint_heterofl.pth"
     start_round = 0
 
     if os.path.exists(checkpoint_path):
@@ -332,7 +326,7 @@ if __name__ == '__main__':
             summary_acc_test_collect = checkpoint['acc_history']
             start_round = checkpoint['round'] + 1
             
-            # [SHFL特有] 恢复client状态和电量
+            # 恢复client状态和电量
             if 'active_clients' in checkpoint:
                 active_clients = checkpoint['active_clients']
                 logger.info(f"  Restored active_clients: {active_clients}")
@@ -340,14 +334,6 @@ if __name__ == '__main__':
                 for idx, state in checkpoint['client_states'].items():
                     client_states[idx]['E'] = state['E']
                 logger.info(f"  Restored client battery levels")
-            
-            # [SHFL特有] 恢复RL Agent状态
-            if 'rl_agent_state' in checkpoint:
-                try:
-                    rl_agent.load_state(checkpoint['rl_agent_state'])
-                    logger.info(f"  Restored RL Agent state")
-                except Exception as e:
-                    logger.warning(f"  Failed to restore RL Agent: {e}. Will retrain.")
             
             logger.success(f"✅ Successfully resumed from Round {start_round}!")
             logger.info(f"  Last Acc: {summary_acc_test_collect[-1]:.2f}%")
@@ -372,39 +358,32 @@ if __name__ == '__main__':
         logger.info(f"🔋 Active Clients Pool: {len(active_clients)}")
         current_m = min(target_m, len(active_clients))    
         
-        # 1. 准备 RL 输入
-        observations = []
-        device_types = []
-        for i in range(num_physical_clients):
-            if i in active_clients:
-                observations.append(client_states[i])
-            else:
-                # 死亡设备
-                dead = client_states[i].copy()
-                dead['E'] = 0.0
-                observations.append(dead)
-            # 添加设备类型信息
-            device_types.append(id_to_type[i])
+        # ========== [HeteroFL Baseline: 随机选择 + 设备类型规则] ==========
+        # 1. 随机选择 current_m 个活跃客户端
+        idxs_users = np.random.choice(active_clients, current_m, replace=False)
         
-        # 2. RL 决策 (传入设备类型)
-        decisions = rl_agent.select_models(observations, device_types, round_num=iter)
-        
-        # 3. Top-K 筛选
-        valid_decisions = [d for d in decisions if d['client_idx'] in active_clients]
-        valid_decisions.sort(key=lambda x: x['q_value'], reverse=True)
-        top_k = valid_decisions[:current_m]
-        
-        idxs_users = []
+        # 2. 根据设备类型分配模型深度
         client_model_map = {}
-        for d in top_k:
-            c_idx = d['client_idx']
-            idxs_users.append(c_idx)
-            client_model_map[c_idx] = d['action'] # Model 1-4
-
-        idxs_users = np.array(idxs_users)
+        for idx in idxs_users:
+            device_type = id_to_type[idx]
+            
+            if device_type == 'nano':
+                # Nano: 固定 Model-1
+                model_idx = 1
+            elif device_type == 'xavier':
+                # Xavier: 随机选择 Model-2 或 Model-3
+                model_idx = random.choice([2, 3])
+            elif device_type == 'orin':
+                # Orin: 随机选择 Model-3 或 Model-4
+                model_idx = random.choice([3, 4])
+            else:
+                # 兜底：默认 Model-4
+                model_idx = 4
+            
+            client_model_map[idx] = model_idx
         
         print(f"\n{'='*60}")
-        print(f"Round {iter}: RL Top-{current_m}")
+        print(f"Round {iter}: Random Selection (HeteroFL Baseline) - {current_m} clients")
         print(f"Selection: {idxs_users}")
         print(f"Models: {[client_model_map[i] for i in idxs_users]}")
         print(f"{'='*60}\n")
@@ -500,23 +479,20 @@ if __name__ == '__main__':
         # ==========================================
         # [新增] 断点续训 - 保存 Checkpoint
         # ==========================================
-        checkpoint_path = "checkpoint_shfl.pth"
-        checkpoint_path_tmp = checkpoint_path + ".tmp"  # 先写临时文件，防止保存时崩溃导致文件损坏
+        checkpoint_path = "checkpoint_heterofl.pth"
+        checkpoint_path_tmp = checkpoint_path + ".tmp"
         
         state = {
             'round': iter,
             'model_state_dict': net_glob.state_dict(),
             'acc_history': summary_acc_test_collect,
-            # [SHFL特有] 保存client状态和活跃列表
             'active_clients': active_clients,
             'client_states': client_states,
-            # [SHFL特有] 保存RL Agent状态
-            'rl_agent_state': rl_agent.get_state() if hasattr(rl_agent, 'get_state') else None,
         }
         
         try:
             torch.save(state, checkpoint_path_tmp)
-            os.replace(checkpoint_path_tmp, checkpoint_path)  # 原子操作，避免文件损坏
+            os.replace(checkpoint_path_tmp, checkpoint_path)
             logger.info(f"💾 Checkpoint saved (Round {iter}, Acc {acc:.2f}%)")
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")

@@ -191,3 +191,21 @@ class SHFLAgentManager:
                 self.last_actions[i][action] = 1.0
                 
         return client_decisions
+    
+    # ==========================================
+    # [新增] 断点续训支持
+    # ==========================================
+    def get_state(self):
+        """保存RL Agent的完整状态（用于断点续训）"""
+        return {
+            'hidden_states': self.hidden_states.clone(),
+            'last_actions': self.last_actions.clone(),
+            'rnn_state_dict': self.eval_rnn.state_dict()
+        }
+    
+    def load_state(self, state):
+        """加载RL Agent的状态（断点恢复）"""
+        self.hidden_states = state['hidden_states'].to(self.device)
+        self.last_actions = state['last_actions'].to(self.device)
+        self.eval_rnn.load_state_dict(state['rnn_state_dict'])
+        logger.info("✅ RL Agent state restored from checkpoint")

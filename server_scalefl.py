@@ -6,6 +6,8 @@ import numpy as np
 import random
 from loguru import logger
 from torch.utils.data import DataLoader
+import datetime
+import os
 
 # 引入工具类
 from utils.ConnectHandler_server import ConnectHandler
@@ -60,11 +62,12 @@ def get_split_indices(global_k, global_v, rate):
 # 2. 核心函数：ScaleFL 下发
 # -------------------------------------------------------------------------
 def scalefl_distribute(global_model_state, rate, user_exit_idx, exit_block_map):
-    # 如果是完全体，直接深拷贝返回
-    if rate == 1.0 and user_exit_idx == len(exit_block_map) - 1:
-        # 依然需要过滤 BN 统计量，因为 Client 是 track=False
-        pass
-        
+    """
+    从 Server 全局模型切片参数下发到 Client。
+    
+    关键：实现 sBN (Silo BN)，即不下发 BN 统计量 (running_mean, running_var)，
+    让每个 Client 在自己的 non-IID 数据上维护独立的 BN 统计。
+    """
     local_state = {}
     max_allowed_block = exit_block_map[user_exit_idx]
     
@@ -164,26 +167,43 @@ def stats(dataset, model, args):
     终极版 BN 校准函数 (解决 NoneType 问题)
     """
     logger.info("Starting BN calibration...")
+    # [DEBUG] 打印数据集大小，检查 Server 是否真的持有数据
+    logger.info(f"DEBUG: Server dataset size: {len(dataset)}")
+    
     test_model = copy.deepcopy(model)
     test_model.to(args.device)
     
+    # [DEBUG] 打印校准前的 BN 均值（抽查第一层）
+    for name, module in test_model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            logger.info(f"DEBUG: Before Calib - {name} mean head: {module.running_mean[:5].tolist()}")
+            break
+    
     # 强制所有 BN 层进入追踪模式
+    test_model.train()  # 🔥 关键：必须设置为train模式
     for module in test_model.modules():
         if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
             if module.track_running_stats:
                 module.reset_running_stats()
             module.track_running_stats = True
+            module.momentum = None  # 🔥 关键：使用累积平均而非指数移动平均（更适合少量 batch 校准）
             module.training = True 
 
     data_loader = DataLoader(dataset, batch_size=args.bs, shuffle=True, drop_last=True)
     batch_processed = 0
-    with torch.no_grad():
+    with torch.no_grad():  # 不需要梯度，但BN统计量仍会更新
         for i, (images, _) in enumerate(data_loader):
             if i >= 50: break 
             images = images.to(args.device)
             # ScaleFL forward 返回的是 list，我们只需要跑通即可
             _ = test_model(images)
             batch_processed += 1
+    
+    # [DEBUG] 打印校准后的 BN 均值
+    for name, module in test_model.named_modules():
+        if isinstance(module, nn.BatchNorm2d):
+            logger.info(f"DEBUG: After Calib  - {name} mean head: {module.running_mean[:5].tolist()}")
+            break
             
     test_model.eval()
     logger.info(f"✅ BN calibration finished after {batch_processed} batches.")
@@ -215,16 +235,16 @@ if __name__ == '__main__':
     # ========== [设备配置] ==========
     # 1. 物理设备 MAC 表 (必须替换为真实 MAC)
     device_info_map = {
-        0: {'mac': "3c:6d:66:28:57:90", 'ip': "192.168.31.19"}, # Orin
-        1: {'mac': "48:b0:2d:2f:e2:d9", 'ip': "192.168.31.243"}, # Xavier
-        2: {'mac': "48:b0:2d:2f:eb:0e", 'ip': "192.168.31.198"}, # Xavier
+        0: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.154"}, # Nano
+        1: {'mac': "48:b0:2d:3c:ca:18", 'ip': "192.168.31.239"}, # Nano
+        2: {'mac': "48:b0:2d:3c:cc:f3", 'ip': "192.168.31.142"}, # Nano
         3: {'mac': "48:b0:2d:3c:cc:df", 'ip': "192.168.31.121"}, # Nano
         4: {'mac': "48:b0:2d:3c:ca:27", 'ip': "192.168.31.237"}, # Nano
         5: {'mac': "48:b0:2d:3c:ca:20", 'ip': "192.168.31.231"}, # Nano
         6: {'mac': "48:b0:2d:3c:ca:2e", 'ip': "192.168.31.244"}, # Nano
-        7: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.154"}, # Nano
-        8: {'mac': "48:b0:2d:3c:ca:18", 'ip': "192.168.31.239"}, # Nano
-        9: {'mac': "48:b0:2d:3c:cc:f3", 'ip': "192.168.31.142"}, # Nano
+        7: {'mac': "48:b0:2d:2f:e2:d9", 'ip': "192.168.31.243"}, # Xavier
+        8: {'mac': "48:b0:2d:2f:eb:0e", 'ip': "192.168.31.198"}, # Xavier
+        9: {'mac': "3c:6d:66:28:57:90", 'ip': "192.168.31.19"}, # Orin
     }
     
     num_physical_clients = len(device_info_map)
@@ -234,15 +254,22 @@ if __name__ == '__main__':
     # 2. ScaleFL 性能分配表 (ID -> Rate, Exit_Idx)
     device_config_map = {}
     # Orin: Rate 1.0, Full Depth (Exit 3)
-    device_config_map[0] = (1.0, 3)
-    # Xavier: Rate 0.5, Depth 3 (Exit 2)
-    device_config_map[1] = (1.0, 2)
-    device_config_map[2] = (1.0, 2)
-    # Nano: Rate 0.25, Depth 2 (Exit 1)
-    for i in range(3, 10):
+    device_config_map[9] = (1.0, 3)
+    # Xavier: Rate 1.0, Depth 2 (Exit 2)
+    device_config_map[7] = (1.0, 2)
+    device_config_map[8] = (1.0, 2)
+    # Nano: Rate 1.0, Depth 1 (Exit 1)
+    for i in range(0, 7):
         device_config_map[i] = (1.0, 1)
+    
+    # 3. 初始化 Client 状态 (电量追踪)
+    client_states = {}
+    for i in range(num_physical_clients):
+        client_states[i] = {
+            'E': 1.0,  # 初始电量 100%
+        }
 
-    # 3. 全局模型配置
+    # 4. 全局模型配置
     global_model_config = {
         'ee_layer_locations': [2, 4, 6], 
         'scale': 1.0
@@ -267,9 +294,45 @@ if __name__ == '__main__':
     # 目标采样数
     target_m = max(int(args.frac * num_physical_clients), 1)
     
+    # ==========================================
+    # [新增] 断点续训 - 加载 Checkpoint
+    # ==========================================
+    checkpoint_path = "checkpoint_scalefl.pth"
+    start_round = 0
+
+    if os.path.exists(checkpoint_path):
+        logger.info(f"📂 Found checkpoint: {checkpoint_path}, Resuming...")
+        try:
+            checkpoint = torch.load(checkpoint_path, map_location=args.device)
+            net_glob.load_state_dict(checkpoint['model_state_dict'])
+            summary_acc_test_collect = checkpoint['acc_history']
+            time_collect = checkpoint['time_history']
+            start_round = checkpoint['round'] + 1
+            
+            # 恢复client状态和电量
+            if 'active_clients' in checkpoint:
+                active_clients = checkpoint['active_clients']
+                logger.info(f"  Restored active_clients: {active_clients}")
+            if 'client_states' in checkpoint:
+                for idx, state in checkpoint['client_states'].items():
+                    client_states[idx]['E'] = state['E']
+                logger.info(f"  Restored client battery levels")
+            
+            logger.success(f"✅ Successfully resumed from Round {start_round}!")
+            logger.info(f"  Last Acc: {summary_acc_test_collect[-1]:.2f}%")
+        except Exception as e:
+            logger.error(f"❌ Failed to resume: {e}. Starting from scratch.")
+            start_round = 0
+    else:
+        logger.info("🆕 No checkpoint found. Starting from scratch.")
+    
     # ========== [训练循环] ==========
-    for iter in range(args.epochs):
-        # [Step 2.2] 检查存活
+    for iter in range(start_round, args.epochs):        # 记录本轮开始时间
+        round_start_time = datetime.datetime.now()
+        logger.info(f"\n{'='*60}")
+        logger.info(f"🕐 Round {iter} Start Time: {round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
+        logger.info(f"{'='*60}")
+                # [Step 2.2] 检查存活
         if not active_clients:
             logger.critical("🪫 All clients have run out of battery. Stopping training.")
             break
@@ -279,23 +342,8 @@ if __name__ == '__main__':
         # 动态调整 m
         current_m = min(target_m, len(active_clients))
         
-        # 采样
-        if iter == 0:
-            # 第一轮 Hack: 强制选中 Orin (如果它还活着)
-            if 0 in active_clients and current_m > 0:
-                idxs_users = [0]
-                # 如果需要更多设备，从剩余活跃设备中随机选择
-                if current_m > 1:
-                    remaining = [c for c in active_clients if c != 0]
-                    if len(remaining) >= current_m - 1:
-                        idxs_users.extend(np.random.choice(remaining, current_m - 1, replace=False))
-                    else:
-                        idxs_users.extend(remaining)  # 全选剩余设备
-                logger.warning(f"Round 0: Forced Client 0 in selection: {idxs_users}")
-            else:
-                idxs_users = np.random.choice(active_clients, current_m, replace=False)
-        else:
-            idxs_users = np.random.choice(active_clients, current_m, replace=False)
+        # 随机选择客户端
+        idxs_users = np.random.choice(active_clients, current_m, replace=False)
             
         print(f"\n{'='*60}")
         print(f"Round {iter}: Selected Clients {idxs_users}")
@@ -354,6 +402,10 @@ if __name__ == '__main__':
                 
             responses_received += 1
             
+            # [🔥 新增] 更新 Client 电量信息
+            if 'battery_level' in msg:
+                client_states[client_idx]['E'] = msg['battery_level']
+            
             # [处理低电量退出]
             if msg['type'] == 'status' and msg.get('status') == 'low_battery':
                 logger.warning(f"🪫 Client {client_idx} reported LOW BATTERY and is exiting.")
@@ -368,6 +420,7 @@ if __name__ == '__main__':
                 
                 if client_idx in active_clients:
                     active_clients.remove(client_idx)
+                    client_states[client_idx]['E'] = 0.0
             
             # [处理正常模型]
             elif msg['type'] == 'net':
@@ -400,13 +453,42 @@ if __name__ == '__main__':
         # 评估
         acc = summary_evaluate(net_glob, dataset_test, args.device) * 100
         
-        current_time = time.time()
         summary_acc_test_collect.append(acc)
-        time_collect.append(current_time)
+        
+        # 记录本轮结束时间和持续时长
+        round_end_time = datetime.datetime.now()
+        round_duration = (round_end_time - round_start_time).total_seconds()
+        time_collect.append(round_duration)
 
         print("\n" + "="*60)
         print(f"📊 Round {iter}: Global Acc (Final Exit) = {acc:.2f}%")
+        print(f"🕐 Round Duration: {round_duration:.2f}s")
         print("="*60 + "\n")
+        
+        # 输出CSV格式数据，方便后续分析
+        logger.info(f"RESULT_CSV,{iter},{acc:.2f},{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
+        
+        # ==========================================
+        # [新增] 断点续训 - 保存 Checkpoint
+        # ==========================================
+        checkpoint_path = "checkpoint_scalefl.pth"
+        checkpoint_path_tmp = checkpoint_path + ".tmp"
+        
+        state = {
+            'round': iter,
+            'model_state_dict': net_glob.state_dict(),
+            'acc_history': summary_acc_test_collect,
+            'time_history': time_collect,
+            'active_clients': active_clients,
+            'client_states': client_states,
+        }
+        
+        try:
+            torch.save(state, checkpoint_path_tmp)
+            os.replace(checkpoint_path_tmp, checkpoint_path)
+            logger.info(f"💾 Checkpoint saved (Round {iter}, Acc {acc:.2f}%)")
+        except Exception as e:
+            logger.error(f"Failed to save checkpoint: {e}")
 
     save_result(summary_acc_test_collect, 'scalefl_acc', args)
     save_result(time_collect, 'scalefl_time', args)
