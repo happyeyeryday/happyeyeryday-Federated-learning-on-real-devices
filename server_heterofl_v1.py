@@ -200,9 +200,18 @@ def stats(dataset, model, args):
     return test_model
 
 def summary_evaluate(net, dataset_test, device):
+    """
+    评估所有 Model 的准确率
+    Returns:
+        list: [acc_model1, acc_model2, acc_model3, acc_model4] (百分比形式)
+    """
     net.eval()
     dtLoader = DataLoader(dataset_test, batch_size=128, shuffle=True, num_workers=0)
-    metric = Accumulator(2)
+    
+    # 初始化 4 个 model 的累加器
+    num_models = 4
+    metrics = [Accumulator(2) for _ in range(num_models)]
+    
     with torch.no_grad():
         for images, labels in dtLoader:
             images, labels = images.to(device), labels.to(device)
@@ -210,16 +219,19 @@ def summary_evaluate(net, dataset_test, device):
             outputs = net(images) 
             
             # Three_ResNet_ALL返回tuple: (output[0-3], features_end, embedding)
-            # output[3]是Model-4的logits（最深层）
             if isinstance(outputs, tuple):
-                logits_list = outputs[0]  # 第一个元素是输出列表
-                final_pred = logits_list[-1]  # 取最后一个exit(Model-4)
+                logits_list = outputs[0]  # [model1_out, model2_out, model3_out, model4_out]
             else:
-                # 兼容Three_ResNet（不应该走到这里，但保留以防万一）
-                final_pred = outputs
-
-            metric.add(accuracy(final_pred, labels), labels.numel())
-    return metric[0] / metric[1]
+                # 兼容Three_ResNet（单一输出）
+                logits_list = [outputs]
+            
+            # 计算每个 model 的准确率
+            for i, pred in enumerate(logits_list):
+                metrics[i].add(accuracy(pred, labels), labels.numel())
+    
+    # 返回所有准确率（转为百分比）
+    acc_list = [(m[0] / m[1]) * 100 for m in metrics]
+    return acc_list
 
 def init_weights(m):
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
@@ -234,7 +246,7 @@ if __name__ == '__main__':
 
     # 1. 设备配置
     device_info_map = {
-        0: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.154"}, # Nano
+        0: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.161"}, # Nano
         1: {'mac': "48:b0:2d:3c:ca:18", 'ip': "192.168.31.239"}, # Nano
         2: {'mac': "48:b0:2d:3c:cc:f3", 'ip': "192.168.31.142"}, # Nano
         3: {'mac': "48:b0:2d:3c:cc:df", 'ip': "192.168.31.121"}, # Nano
@@ -336,7 +348,11 @@ if __name__ == '__main__':
                 logger.info(f"  Restored client battery levels")
             
             logger.success(f"✅ Successfully resumed from Round {start_round}!")
-            logger.info(f"  Last Acc: {summary_acc_test_collect[-1]:.2f}%")
+            last_acc = summary_acc_test_collect[-1]
+            if isinstance(last_acc, list):
+                logger.info(f"  Last Acc: Model1={last_acc[0]:.2f}%, Model2={last_acc[1]:.2f}%, Model3={last_acc[2]:.2f}%, Model4={last_acc[3]:.2f}%")
+            else:
+                logger.info(f"  Last Acc (Legacy): {last_acc:.2f}%")
         except Exception as e:
             logger.error(f"❌ Failed to resume: {e}. Starting from scratch.")
             start_round = 0
@@ -369,13 +385,15 @@ if __name__ == '__main__':
             
             if device_type == 'nano':
                 # Nano: 固定 Model-1
-                model_idx = 1
+                model_idx = 2
             elif device_type == 'xavier':
                 # Xavier: 随机选择 Model-2 或 Model-3
-                model_idx = random.choice([2, 3])
+                # model_idx = random.choice([2, 3])
+                model_idx = 3
             elif device_type == 'orin':
                 # Orin: 随机选择 Model-3 或 Model-4
-                model_idx = random.choice([3, 4])
+                # model_idx = random.choice([3, 4])
+                model_idx = 4
             else:
                 # 兜底：默认 Model-4
                 model_idx = 4
@@ -457,24 +475,30 @@ if __name__ == '__main__':
             w_glob = shfl_aggregate(w_local_client, model_indices_this_round, net_glob)
             net_glob.load_state_dict(w_glob, strict=False)
         
-        # 8. 校准与评估
+        # 8. 校准与评估所有模型
         net_glob_calibrated = stats(dataset_train, net_glob, args)
         net_glob.load_state_dict(net_glob_calibrated.state_dict(), strict=False)
         
-        acc = summary_evaluate(net_glob, dataset_test, args.device) * 100
-        summary_acc_test_collect.append(acc)
+        acc_list = summary_evaluate(net_glob, dataset_test, args.device)  # [acc1, acc2, acc3, acc4]
+        summary_acc_test_collect.append(acc_list)
         
         # 记录本轮结束时间和持续时长
         round_end_time = datetime.datetime.now()
         round_duration = (round_end_time - round_start_time).total_seconds()
         
         print("\n" + "="*60)
-        print(f"📊 Round {iter}: Global Acc = {acc:.2f}%")
+        print(f"📊 Round {iter} Accuracy Results:")
+        print(f"   Model-1 (Block 0):     {acc_list[0]:.2f}%")
+        print(f"   Model-2 (Block 0-1):   {acc_list[1]:.2f}%")
+        print(f"   Model-3 (Block 0-2):   {acc_list[2]:.2f}%")
+        print(f"   Model-4 (Block 0-3):   {acc_list[3]:.2f}%")
         print(f"🕐 Round Duration: {round_duration:.2f}s")
         print("="*60 + "\n")
         
         # 输出CSV格式数据，方便后续分析
-        logger.info(f"RESULT_CSV,{iter},{acc:.2f},{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
+        logger.info(f"RESULT_CSV,{iter},{acc_list[0]:.2f},{acc_list[1]:.2f},{acc_list[2]:.2f},{acc_list[3]:.2f},"
+                   f"{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},"
+                   f"{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
         
         # ==========================================
         # [新增] 断点续训 - 保存 Checkpoint
@@ -493,8 +517,21 @@ if __name__ == '__main__':
         try:
             torch.save(state, checkpoint_path_tmp)
             os.replace(checkpoint_path_tmp, checkpoint_path)
-            logger.info(f"💾 Checkpoint saved (Round {iter}, Acc {acc:.2f}%)")
+            logger.info(f"💾 Checkpoint saved (Round {iter}, Model4_Acc {acc_list[3]:.2f}%)")
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    save_result(summary_acc_test_collect, 'shfl_acc', args)
+    # 保存结果
+    acc_array = np.array(summary_acc_test_collect)  # Shape: (num_rounds, 4)
+    
+    # 保存为 numpy 数组（方便分析）
+    np.save('heterofl_acc_all_models.npy', acc_array)
+    logger.info(f"💾 Saved all models accuracy to heterofl_acc_all_models.npy (shape: {acc_array.shape})")
+    
+    # 分别保存每个 model 的结果
+    for model_idx in range(4):
+        model_acc_list = acc_array[:, model_idx].tolist()
+        save_result(model_acc_list, f'heterofl_acc_model{model_idx+1}', args)
+    
+    # 保存最终模型（Model-4）作为主结果（向后兼容）
+    save_result(acc_array[:, 3].tolist(), 'shfl_acc', args)

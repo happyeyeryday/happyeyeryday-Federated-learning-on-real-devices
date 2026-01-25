@@ -176,17 +176,26 @@ def stats(dataset, model, args):
     # [DEBUG] 打印校准前的 BN 均值（抽查第一层）
     for name, module in test_model.named_modules():
         if isinstance(module, nn.BatchNorm2d):
-            logger.info(f"DEBUG: Before Calib - {name} mean head: {module.running_mean[:5].tolist()}")
+            if module.running_mean is not None:
+                logger.info(f"DEBUG: Before Calib - {name} mean head: {module.running_mean[:5].tolist()}")
+            else:
+                logger.info(f"DEBUG: Before Calib - {name} running_mean is None (sBN mode, will create)")
             break
     
-    # 强制所有 BN 层进入追踪模式
-    test_model.train()  # 🔥 关键：必须设置为train模式
+    # 强制所有 BN 层进入追踪模式（sBN -> 校准时需要统计量）
+    test_model.train()
     for module in test_model.modules():
         if isinstance(module, (nn.BatchNorm1d, nn.BatchNorm2d, nn.BatchNorm3d)):
-            if module.track_running_stats:
-                module.reset_running_stats()
-            module.track_running_stats = True
-            module.momentum = None  # 🔥 关键：使用累积平均而非指数移动平均（更适合少量 batch 校准）
+            # 🔥 如果 sBN 模式（running_mean 是 None），需要先创建 buffer
+            if module.running_mean is None:
+                module.register_buffer('running_mean', torch.zeros(module.num_features, device=module.weight.device))
+                module.register_buffer('running_var', torch.ones(module.num_features, device=module.weight.device))
+                module.register_buffer('num_batches_tracked', torch.tensor(0, dtype=torch.long, device=module.weight.device))
+            else:
+                module.reset_running_stats()  # 如果已存在，重置为 0
+            
+            module.track_running_stats = True  # 启用追踪
+            module.momentum = None  # 使用累积平均
             module.training = True 
 
     data_loader = DataLoader(dataset, batch_size=args.bs, shuffle=True, drop_last=True)
@@ -202,7 +211,10 @@ def stats(dataset, model, args):
     # [DEBUG] 打印校准后的 BN 均值
     for name, module in test_model.named_modules():
         if isinstance(module, nn.BatchNorm2d):
-            logger.info(f"DEBUG: After Calib  - {name} mean head: {module.running_mean[:5].tolist()}")
+            if module.running_mean is not None:
+                logger.info(f"DEBUG: After Calib  - {name} mean head: {module.running_mean[:5].tolist()}")
+            else:
+                logger.info(f"DEBUG: After Calib  - {name} running_mean is None (calibration failed)")
             break
             
     test_model.eval()
@@ -214,16 +226,30 @@ def init_weights(m):
         nn.init.xavier_uniform_(m.weight)
 
 def summary_evaluate(net, dataset_test, device):
+    """
+    评估所有 Exit 的准确率
+    Returns:
+        list: [acc_exit0, acc_exit1, acc_exit2, acc_exit3] (百分比形式)
+    """
     net.eval()
     dtLoader = DataLoader(dataset_test, batch_size=128, shuffle=True, num_workers=0)
-    metric = Accumulator(2)
+    
+    # 初始化 4 个 exit 的累加器 (3个EE + 1个Linear)
+    num_exits = 4
+    metrics = [Accumulator(2) for _ in range(num_exits)]
+    
     with torch.no_grad():
         for images, labels in dtLoader:
             images, labels = images.to(device), labels.to(device)
-            preds_list = net(images)
-            final_pred = preds_list[-1]
-            metric.add(accuracy(final_pred, labels), labels.numel())
-    return metric[0] / metric[1]
+            preds_list = net(images)  # [ee0_out, ee1_out, ee2_out, linear_out]
+            
+            # 计算每个 exit 的准确率
+            for i, pred in enumerate(preds_list):
+                metrics[i].add(accuracy(pred, labels), labels.numel())
+    
+    # 返回所有准确率（转为百分比）
+    acc_list = [(m[0] / m[1]) * 100 for m in metrics]
+    return acc_list
 
 # -------------------------------------------------------------------------
 # 主程序
@@ -235,7 +261,7 @@ if __name__ == '__main__':
     # ========== [设备配置] ==========
     # 1. 物理设备 MAC 表 (必须替换为真实 MAC)
     device_info_map = {
-        0: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.154"}, # Nano
+        0: {'mac': "48:b0:2d:3c:cc:ff", 'ip': "192.168.31.161"}, # Nano
         1: {'mac': "48:b0:2d:3c:ca:18", 'ip': "192.168.31.239"}, # Nano
         2: {'mac': "48:b0:2d:3c:cc:f3", 'ip': "192.168.31.142"}, # Nano
         3: {'mac': "48:b0:2d:3c:cc:df", 'ip': "192.168.31.121"}, # Nano
@@ -319,7 +345,11 @@ if __name__ == '__main__':
                 logger.info(f"  Restored client battery levels")
             
             logger.success(f"✅ Successfully resumed from Round {start_round}!")
-            logger.info(f"  Last Acc: {summary_acc_test_collect[-1]:.2f}%")
+            last_acc = summary_acc_test_collect[-1]
+            if isinstance(last_acc, list):
+                logger.info(f"  Last Acc: Exit0={last_acc[0]:.2f}%, Exit1={last_acc[1]:.2f}%, Exit2={last_acc[2]:.2f}%, Exit3={last_acc[3]:.2f}%")
+            else:
+                logger.info(f"  Last Acc (Legacy): {last_acc:.2f}%")
         except Exception as e:
             logger.error(f"❌ Failed to resume: {e}. Starting from scratch.")
             start_round = 0
@@ -450,10 +480,10 @@ if __name__ == '__main__':
         # 只更新参数，保持 net_glob 的 track 状态
         net_glob.load_state_dict(net_glob_calibrated.state_dict(), strict=False)
 
-        # 评估
-        acc = summary_evaluate(net_glob, dataset_test, args.device) * 100
+        # 评估所有出口
+        acc_list = summary_evaluate(net_glob, dataset_test, args.device)  # [acc0, acc1, acc2, acc3]
         
-        summary_acc_test_collect.append(acc)
+        summary_acc_test_collect.append(acc_list)
         
         # 记录本轮结束时间和持续时长
         round_end_time = datetime.datetime.now()
@@ -461,12 +491,18 @@ if __name__ == '__main__':
         time_collect.append(round_duration)
 
         print("\n" + "="*60)
-        print(f"📊 Round {iter}: Global Acc (Final Exit) = {acc:.2f}%")
+        print(f"📊 Round {iter} Accuracy Results:")
+        print(f"   Exit 0 (After Block 0): {acc_list[0]:.2f}%")
+        print(f"   Exit 1 (After Block 1): {acc_list[1]:.2f}%")
+        print(f"   Exit 2 (After Block 2): {acc_list[2]:.2f}%")
+        print(f"   Exit 3 (After Block 3): {acc_list[3]:.2f}%")
         print(f"🕐 Round Duration: {round_duration:.2f}s")
         print("="*60 + "\n")
         
         # 输出CSV格式数据，方便后续分析
-        logger.info(f"RESULT_CSV,{iter},{acc:.2f},{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
+        logger.info(f"RESULT_CSV,{iter},{acc_list[0]:.2f},{acc_list[1]:.2f},{acc_list[2]:.2f},{acc_list[3]:.2f},"
+                   f"{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},"
+                   f"{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
         
         # ==========================================
         # [新增] 断点续训 - 保存 Checkpoint
@@ -486,9 +522,22 @@ if __name__ == '__main__':
         try:
             torch.save(state, checkpoint_path_tmp)
             os.replace(checkpoint_path_tmp, checkpoint_path)
-            logger.info(f"💾 Checkpoint saved (Round {iter}, Acc {acc:.2f}%)")
+            logger.info(f"💾 Checkpoint saved (Round {iter}, Exit3_Acc {acc_list[3]:.2f}%)")
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    save_result(summary_acc_test_collect, 'scalefl_acc', args)
+    # 保存结果
+    acc_array = np.array(summary_acc_test_collect)  # Shape: (num_rounds, 4)
+    
+    # 保存为 numpy 数组（方便分析）
+    np.save('scalefl_acc_all_exits.npy', acc_array)
+    logger.info(f"💾 Saved all exits accuracy to scalefl_acc_all_exits.npy (shape: {acc_array.shape})")
+    
+    # 分别保存每个 exit 的结果
+    for exit_idx in range(4):
+        exit_acc_list = acc_array[:, exit_idx].tolist()
+        save_result(exit_acc_list, f'scalefl_acc_exit{exit_idx}', args)
+    
+    # 保存最终出口（Exit 3）作为主结果（向后兼容）
+    save_result(acc_array[:, 3].tolist(), 'scalefl_acc', args)
     save_result(time_collect, 'scalefl_time', args)

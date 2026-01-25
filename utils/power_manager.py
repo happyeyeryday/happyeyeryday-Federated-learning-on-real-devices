@@ -31,9 +31,9 @@ POWER_CONFIG = {
 
 # [TODO] 在此处填写你为设备模拟的总电量 (单位：焦耳)
 BATTERY_CAPACITY = {
-    'orin': 150000,  # J
-    'xavier': 150000, # J
-    'nano': 150000,   # J
+    'orin': 300000,  # J
+    'xavier': 300000, # J
+    'nano': 300000,   # J
 }
 
 

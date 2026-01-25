@@ -15,7 +15,7 @@ class KDLoss(nn.Module):
     def __init__(self, args):
         super(KDLoss, self).__init__()
 
-        self.kld_loss = nn.KLDivLoss()
+        self.kld_loss = nn.KLDivLoss(reduction='batchmean')
         self.ce_loss = nn.CrossEntropyLoss()
         self.log_softmax = nn.LogSoftmax(dim=1)
         self.softmax = nn.Softmax(dim=1)
@@ -27,7 +27,8 @@ class KDLoss(nn.Module):
         _ce = self.ce_loss(pred, target)
         T = self.T
         if self.gamma and gamma_active:
-            # _ce = (1. - self.gamma) * _ce
+            # 标准 KD 公式：(1-α)*CE + α*T²*KL
+            _ce = (1. - self.gamma) * _ce  # ✅ 修复：CE 应用 (1-gamma) 权重
             _kld = self.kld_loss(self.log_softmax(pred / T), self.softmax(soft_target / T)) * self.gamma * T * T
         else:
             _kld = 0
