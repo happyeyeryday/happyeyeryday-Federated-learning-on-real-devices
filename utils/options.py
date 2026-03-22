@@ -80,11 +80,11 @@ def args_parser():
 # ================= ScaleFL / HeteroFL 新增参数 =================
     # 1. 本地训练轮数 (修复 Bug 1)
     # parser.add_argument('--local_ep', type=int, default=5, help="number of local epochs: E")
-    
+
     # 2. BN层统计量追踪 (修复 Bug 2)
     # ScaleFL 推荐 False (即使用 sBN)，设为 0 表示 False
     parser.add_argument('--track_running_stats', type=int, default=0, help='0 for False (sBN), 1 for True')
-    
+
     # 3. 自蒸馏 (Self-Distillation) 参数
     parser.add_argument('--KD_T', type=float, default=4.0, help='temperature for KD')
     parser.add_argument('--KD_gamma', type=float, default=0.5, help='weight for KD loss')

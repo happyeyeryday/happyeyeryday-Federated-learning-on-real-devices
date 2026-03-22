@@ -47,7 +47,7 @@ class BatteryManager:
     def __init__(self, device_type: str):
         if device_type not in POWER_CONFIG:
             raise ValueError(f"Unknown device_type: {device_type}. Must be one of {list(POWER_CONFIG.keys())}")
-        
+
         self.device_type = device_type
         self.power_profile = POWER_CONFIG[device_type]
         self.total_capacity = BATTERY_CAPACITY[device_type]
@@ -90,18 +90,18 @@ class BatteryManager:
         if activity not in self.power_profile:
             logger.warning(f"Unknown activity '{activity}'. Using 'idle' power consumption.")
             activity = 'idle'
-            
+
         power_w = self.power_profile[activity]
-        
+
         # 功耗 (J) = 功率 (W) * 秒(s)
         consumed_joules = power_w * duration_seconds
         self.current_charge -= consumed_joules
-        
+
         # 确保电量不为负
         self.current_charge = max(0, self.current_charge)
-        
+
         percentage = self.get_ratio() * 100
-        
+
         logger.info(
             f"⚡ [Battery] Activity: {activity} ({duration_seconds:.1f}s). "
             f"Consumed: {consumed_joules:.4f} J. "
@@ -117,7 +117,7 @@ class BatteryManager:
         if not is_enough:
             logger.warning(f"🪫 [Battery] Low Level! Current: {self.current_charge:.1f} J < Threshold: {threshold} J")
         return is_enough
-    
+
     def get_default_interface():
         """
         通过查询路由表，找到连接到 Server 的网卡接口名称 (Linux only)
@@ -142,7 +142,7 @@ def smart_sleep(server_ip, interface="eth0", ping_timeout=15):
     """
     Client 端智能休眠函数。
     适配 Orin/Xavier/Nano，解决网卡驱动导致的死机/无法唤醒问题。
-    
+
     Args:
         server_ip (str): Server 的 IP 地址，用于唤醒后检测网络恢复。
         interface (str): 网卡接口名称，默认为 eth0。
@@ -179,7 +179,7 @@ def _wait_for_network(server_ip, timeout):
     """(内部函数) 循环 Ping Server 直到网络恢复"""
     start_time = time.time()
     retry_count = 0
-    
+
     while True:
         # 检查是否超时
         if time.time() - start_time > timeout:
@@ -189,7 +189,7 @@ def _wait_for_network(server_ip, timeout):
         # Ping Server (超时1秒)
         # > /dev/null 2>&1 用于屏蔽 ping 的命令行输出
         ret = os.system(f"ping -c 1 -W 1 {server_ip} > /dev/null 2>&1")
-        
+
         if ret == 0:
             duration = int(time.time() - start_time)
             logger.info(f"✅ [PowerManager] 网络已恢复！(耗时 {duration} 秒)")
@@ -208,7 +208,7 @@ def _wait_for_network(server_ip, timeout):
 def wake_clients(mac_to_ip_map, total_timeout, settle_time=WAKE_SETTLE_TIME):
     """
     Server 端批量唤醒函数 (主动确认与重试版)。
-    
+
     Args:
         mac_to_ip_map (dict): 字典，{MAC地址: IP地址}
         total_timeout (int): 整个唤醒过程的最大超时时间(秒)。
@@ -219,9 +219,9 @@ def wake_clients(mac_to_ip_map, total_timeout, settle_time=WAKE_SETTLE_TIME):
 
     # 初始化待唤醒列表
     devices_to_wake = list(mac_to_ip_map.keys())
-    
+
     logger.info(f"⚡ [PowerManager] 开始唤醒 {len(devices_to_wake)} 台设备...")
-    
+
     # 1. 初始批量唤醒
     for mac in devices_to_wake:
         # 发送 3 个包以提高成功率
@@ -229,22 +229,22 @@ def wake_clients(mac_to_ip_map, total_timeout, settle_time=WAKE_SETTLE_TIME):
             cmd = f"wakeonlan {mac} > /dev/null 2>&1"
             os.system(cmd)
             time.sleep(1)
-    
+
     logger.info("初始唤醒包已发送。开始轮询检查设备状态...")
 
     start_time = time.time()
-    
+
     # 2. 循环检查与重试，直到所有设备都上线或超时
     while devices_to_wake and (time.time() - start_time) < total_timeout:
-        
+
         # 遍历所有还未唤醒的设备
         # 使用 [:] 创建副本，以便在循环中安全地修改列表
         for mac in devices_to_wake[:]:
             ip = mac_to_ip_map[mac]
-            
+
             # 使用 ping3 检查，超时设为 1 秒
             is_alive = ping(ip, timeout=1)
-            
+
             if is_alive is not False and is_alive is not None:
                 # 如果 ping 通了 (返回延迟时间)
                 logger.success(f"✅ 设备 {ip} ({mac}) 已上线！")
@@ -253,13 +253,13 @@ def wake_clients(mac_to_ip_map, total_timeout, settle_time=WAKE_SETTLE_TIME):
                 # 如果没 ping 通
                 logger.warning(f"⏳ 设备 {ip} ({mac}) 仍未响应，重新发送唤醒包...")
                 os.system(f"wakeonlan {mac} > /dev/null 2>&1")
-        
+
         # 如果还有设备没醒，等待几秒再进行下一轮检查
         if devices_to_wake:
             remaining_time = int(total_timeout - (time.time() - start_time))
             logger.info(f"还有 {len(devices_to_wake)} 台设备未唤醒。将在 5 秒后重试... (剩余 {remaining_time}s)")
             time.sleep(5)
-    
+
     # 3. 最终结果
     if not devices_to_wake:
         logger.success("🎉 [PowerManager] 所有设备已成功唤醒！")

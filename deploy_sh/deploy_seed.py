@@ -68,7 +68,7 @@ def upload_files():
     for ip, user, pwd in DEVICES:
         print(f"正在连接 -> {user}@{ip} ... ", end="")
         ssh = create_ssh_client(ip, user, pwd)
-        
+
         if ssh:
             try:
                 # 建立 SCP 通道
@@ -78,10 +78,10 @@ def upload_files():
                         if not os.path.exists(file_path):
                             print(f"\n   ⚠️ 本地文件不存在跳过: {file_path}")
                             continue
-                        
+
                         # 执行传输 (recursive=True 支持文件夹)
                         scp.put(file_path, remote_path=REMOTE_PATH, recursive=True)
-                        
+
                 print("✅ 传输成功")
             except Exception as e:
                 print(f"❌ 传输出错: {e}")

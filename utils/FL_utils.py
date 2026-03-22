@@ -40,10 +40,10 @@ def uniform_distribution_loss(a, b=None):
     sum_vec = sum_vec / np.sum(sum_vec)
     uniform_vec = np.array([1 / len(sum_vec) for _ in range(len(sum_vec))])
     return np.linalg.norm(sum_vec - uniform_vec)
-    
+
 def kl_divergence(a, b):
     return abs(sum(a[i] * np.log(a[i]/b[i]+1/1e5) for i in range(len(a))))
-    
+
 def KL_loss(d, args):
     d_0 = np.full(args.num_classes, 1)
     d = d / np.sum(d)

@@ -159,11 +159,11 @@ class ResNet(nn.Module):
         self.bn1 = nn.BatchNorm2d(self.in_planes, track_running_stats=self.trs)
 
         # 2. 构建 Layers (通道数统一为 [64, 128, 256, 512])
-        
+
         # Layer 1 (Block 0): 肯定有
         layer1, ee1 = self._make_layer(block, int(64 * scale), layers[0], stride=1,
                                        ee_layer_locations=[l for i, l in enumerate(ee_layer_list) if ee_block_list[i] == 0])
-        
+
         self.layers = nn.ModuleList([layer1])
         self.ee_classifiers = nn.ModuleList([ee1])
 
@@ -229,22 +229,22 @@ class ResNet(nn.Module):
     @staticmethod
     def find_ee_block_and_layer(layers, layer_idx):
         cum_array = np.cumsum(layers)
-        
+
         # [🔥 修正] 使用默认的 side='left'
         # loc=2 -> Block 0 (正确，Block 0 的末尾)
         # loc=4 -> Block 1 (正确，Block 1 的末尾)
         # loc=6 -> Block 2 (正确，Block 2 的末尾)
         block_idx = np.searchsorted(cum_array, layer_idx)
-        
+
         # 边界检查
         if block_idx >= len(layers):
             return len(layers) - 1, layers[-1]
-            
+
         if block_idx == 0:
             layer = layer_idx
         else:
             layer = layer_idx - cum_array[block_idx - 1]
-            
+
         return block_idx, layer
 
     def forward(self, x, manual_early_exit_index=0):
@@ -313,14 +313,14 @@ def resnet18_scalefl(args, params):
     """
     ee_layer_locations = params.get('ee_layer_locations', [])
     scale = params.get('scale', 1.0)
-    
+
     # 强制 4 个 Block [2, 2, 2, 2]
     return ResNet(
-        BasicBlock, 
-        layers=[2, 2, 2, 2], 
-        num_classes=args.num_classes, 
+        BasicBlock,
+        layers=[2, 2, 2, 2],
+        num_classes=args.num_classes,
         ee_layer_locations=ee_layer_locations,
-        scale=scale, 
+        scale=scale,
         trs=args.track_running_stats,
         is_full_model=True # Server 初始化默认为 Full
     )

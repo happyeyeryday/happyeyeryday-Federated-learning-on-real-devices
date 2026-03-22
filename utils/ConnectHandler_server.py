@@ -33,7 +33,7 @@ class SocketPool:
             return False
         logger.info("sending data ({} bytes) to client#{} completely", length, client_idx)
         return True
-    
+
     @staticmethod
     def send_with_rate_limit(conn, data, client_idx, rate):
         binary_data = pickle.dumps(data)
@@ -43,10 +43,10 @@ class SocketPool:
         binary_data = len_data + binary_data
 
         logger.info("sending data ({} bytes) to client#{}...", length, client_idx)
-        
+
         total_sent = 0
         data_length = len(binary_data)
-        
+
         try:
             while total_sent < data_length:
                 conn.send(binary_data[total_sent:min(total_sent+rate, data_length)])
@@ -85,7 +85,7 @@ class SocketPool:
     def sendData(sc_idx, data):
         return SocketPool.send(SocketPool.connections[sc_idx][0], data, sc_idx)
         pass
-        
+
     @staticmethod
     def sendDataWithRateLimit(sc_idx, data, rate):
         return SocketPool.send_with_rate_limit(SocketPool.connections[sc_idx][0], data, sc_idx, rate)

@@ -15,18 +15,18 @@ class Three_ResNet_Distill(nn.Module):
                  n_models=4):
         super(Three_ResNet_Distill, self).__init__()
         self.branch_layers = branch_layers
-        
+
         self.in_planes = 64
         self.conv1 = conv3x3(3, 64)
         self.bn1 = nn.BatchNorm2d(64)
-        
+
         mainblocks = []
         bottlenecks = []
         fcs = []
-        
+
         self.n_models = n_models
         # 注意：这里的 n_models 实际上是当前 Client 被分配的模型深度 (1-4)
-        
+
         # 构建主干和出口
         temp_in_planes = 64
         for i in range(n_models):
@@ -68,25 +68,25 @@ class Three_ResNet_Distill(nn.Module):
         out = self.conv1(out)
         out = self.bn1(out)
         out = F.relu(out)
-        
+
         # 逐层前向传播，并在每个出口收集结果
         for idx in range(self.n_models):
             out = self.mainblocks[idx](out)
-            
+
             # 计算该层的出口输出
             features_end = self.bottlenecks[idx](out)
             pooled = self.avgpool(features_end)
             flattened = pooled.view(pooled.size(0), -1)
             logits = self.fcs[idx](flattened)
-            
+
             outputs.append(logits)
-            
+
         return outputs # 返回列表
 
 def shfl_resnet18_distill(num_classes=10, model_idx=None):
     """工厂函数：返回支持自蒸馏的模型"""
     # 参数配置复用 _10_3_ResNet18_byot 的配置
-    return Three_ResNet_Distill(PreActBlock, num_classes=num_classes, 
+    return Three_ResNet_Distill(PreActBlock, num_classes=num_classes,
                                 num_blocks=[2, 2, 2, 2], planes=[64, 128, 256, 512],
-                                branch_layers=[3, 2, 1, 0], strides=[1, 2, 2, 2], 
+                                branch_layers=[3, 2, 1, 0], strides=[1, 2, 2, 2],
                                 n_models=model_idx if model_idx else 4)

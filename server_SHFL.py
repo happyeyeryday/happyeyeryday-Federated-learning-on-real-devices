@@ -38,13 +38,13 @@ w_local_client = []
 def shfl_distribute(global_model_state, model_idx):
     """
     从Server全局模型(Three_ResNet_ALL)切片下发到Client(Three_ResNet)。
-    
+
     关键：Server有bottlenecks[0-3]和fcs[0-3]，Client只有bottleneck和fc
     需要将bottlenecks.{model_idx-1}.xxx重命名为bottleneck.xxx
-    
+
     Args:
         model_idx: 1 (Block0), 2 (Block0+1), 3 (Block0-2), 4 (Full)
-    
+
     Structure to Keep:
     - conv1, bn1: Always
     - mainblocks.i: if i <= target_idx
@@ -53,16 +53,16 @@ def shfl_distribute(global_model_state, model_idx):
     """
     local_state = {}
     target_exit_idx = model_idx - 1  # model_idx 1 -> exit_idx 0
-    
+
     for k, v in global_model_state.items():
         # 过滤 BN 统计量 (sBN)
         if 'num_batches_tracked' in k or 'running_mean' in k or 'running_var' in k:
             continue
-            
+
         # 1. 公共头部 (conv1, bn1) - 所有人都要
         if k.startswith('conv1') or k.startswith('bn1'):
             local_state[k] = v.clone()
-            
+
         # 2. 主干网络 (mainblocks)
         elif k.startswith('mainblocks'):
             # 格式: mainblocks.0.xxx
@@ -73,7 +73,7 @@ def shfl_distribute(global_model_state, model_idx):
                 if block_id <= target_exit_idx:
                     local_state[k] = v.clone()
             except: pass
-            
+
         # 3. 瓶颈层 (bottlenecks.i -> bottleneck)
         elif k.startswith('bottlenecks'):
             # 格式: bottlenecks.0.conv1.weight
@@ -86,7 +86,7 @@ def shfl_distribute(global_model_state, model_idx):
                     new_key = 'bottleneck.' + '.'.join(parts[2:])
                     local_state[new_key] = v.clone()
             except: pass
-            
+
         # 4. 分类头 (fcs.i -> fc)
         elif k.startswith('fcs'):
             # 格式: fcs.0.weight
@@ -99,7 +99,7 @@ def shfl_distribute(global_model_state, model_idx):
                     new_key = 'fc.' + '.'.join(parts[2:])
                     local_state[new_key] = v.clone()
             except: pass
-            
+
     return local_state
 
 # =============================================================================
@@ -108,10 +108,10 @@ def shfl_distribute(global_model_state, model_idx):
 def shfl_aggregate(w_local_list, model_indices, net_glob):
     """
     聚合不同深度的模型到Server全局模型(Three_ResNet_ALL)。
-    
+
     关键：Client返回的是bottleneck.xxx和fc.xxx，需要重命名为bottlenecks.{exit_idx}.xxx
     不同深度的Client更新不同的exit，互不冲突。
-    
+
     Args:
         w_local_list: Client参数列表
         model_indices: 每个Client使用的model_idx (1-4)
@@ -120,7 +120,7 @@ def shfl_aggregate(w_local_list, model_indices, net_glob):
     global_state = net_glob.state_dict()
     sum_buffer = {}
     count_buffer = {}
-    
+
     # 初始化 Buffer
     for k, v in global_state.items():
         if 'num_batches_tracked' in k: continue
@@ -130,7 +130,7 @@ def shfl_aggregate(w_local_list, model_indices, net_glob):
     for idx, local_w in enumerate(w_local_list):
         model_idx = model_indices[idx]
         exit_idx = model_idx - 1  # 1->0, 2->1, 3->2, 4->3
-        
+
         for k_local, v_local in local_w.items():
             # 反向重命名: bottleneck.xxx -> bottlenecks.{exit_idx}.xxx
             if k_local.startswith('bottleneck.'):
@@ -143,10 +143,10 @@ def shfl_aggregate(w_local_list, model_indices, net_glob):
             # 其他key保持不变 (conv1, bn1, mainblocks)
             else:
                 k_global = k_local
-            
-            if k_global not in sum_buffer: 
+
+            if k_global not in sum_buffer:
                 continue
-            
+
             # 累加到对应的全局参数
             sum_buffer[k_global] += v_local
             count_buffer[k_global] += 1
@@ -157,13 +157,13 @@ def shfl_aggregate(w_local_list, model_indices, net_glob):
         if 'num_batches_tracked' in k:
             updated_state[k] = global_state[k]  # BN统计量不聚合
             continue
-            
+
         mask = count_buffer[k] > 0
         updated_state[k] = global_state[k].clone()
-        
+
         if mask.any():
             updated_state[k][mask] = (sum_buffer[k][mask] / count_buffer[k][mask]).to(global_state[k].dtype)
-            
+
     return updated_state
 
 # =============================================================================
@@ -172,7 +172,7 @@ def shfl_aggregate(w_local_list, model_indices, net_glob):
 def stats(dataset, model, args):
     logger.info("Starting BN calibration...")
     # 打印数据集大小，检查 Server 是否真的持有数据
-    logger.info(f"DEBUG: Server dataset size: {len(dataset)}") 
+    logger.info(f"DEBUG: Server dataset size: {len(dataset)}")
     test_model = copy.deepcopy(model)
     test_model.to(args.device)
 
@@ -181,7 +181,7 @@ def stats(dataset, model, args):
         if isinstance(module, nn.BatchNorm2d):
             logger.info(f"DEBUG: Before Calib - {name} mean head: {module.running_mean[:5].tolist()}")
             break
-    
+
     # 强制所有 BN 层进入追踪模式并重置统计量
     test_model.train()  # 🔥 关键：必须设置为train模式
     for module in test_model.modules():
@@ -193,7 +193,7 @@ def stats(dataset, model, args):
     data_loader = DataLoader(dataset, batch_size=args.bs, shuffle=True, drop_last=True)
     with torch.no_grad():  # 不需要梯度，但BN统计量仍会更新
         for i, (images, _) in enumerate(data_loader):
-            if i >= 50: break 
+            if i >= 50: break
             images = images.to(args.device)
             # BYOT Forward 返回 tuple/list，跑通即可
             _ = test_model(images)
@@ -203,7 +203,7 @@ def stats(dataset, model, args):
         if isinstance(module, nn.BatchNorm2d):
             logger.info(f"DEBUG: After Calib  - {name} mean head: {module.running_mean[:5].tolist()}")
             break
-    
+
     test_model.eval()
     logger.info("✅ BN calibration finished.")
     return test_model
@@ -216,28 +216,28 @@ def summary_evaluate(net, dataset_test, device):
     """
     net.eval()
     dtLoader = DataLoader(dataset_test, batch_size=128, shuffle=True, num_workers=0)
-    
+
     # 初始化 4 个模型的累加器
     num_models = 4
     metrics = [Accumulator(2) for _ in range(num_models)]
-    
+
     with torch.no_grad():
         for images, labels in dtLoader:
             images, labels = images.to(device), labels.to(device)
             # Three_ResNet_ALL Forward: (output_list, features_end, embedding)
-            outputs = net(images) 
-            
+            outputs = net(images)
+
             # Three_ResNet_ALL返回tuple: (output_list[0-3], features_end, embedding)
             if isinstance(outputs, tuple):
                 logits_list = outputs[0]  # [model1_out, model2_out, model3_out, model4_out]
             else:
                 # 兼容Three_ResNet（不应该走到这里）
                 logits_list = [outputs]
-            
+
             # 计算每个模型的准确率
             for i, pred in enumerate(logits_list):
                 metrics[i].add(accuracy(pred, labels), labels.numel())
-    
+
     # 返回所有准确率（转为百分比）
     acc_list = [(m[0] / m[1]) * 100 for m in metrics]
     return acc_list
@@ -266,7 +266,7 @@ if __name__ == '__main__':
         8: {'mac': "48:b0:2d:2f:eb:0e", 'ip': "192.168.31.198"}, # Xavier
         9: {'mac': "3c:6d:66:28:57:90", 'ip': "192.168.31.19"}, # Orin
     }
-    
+
     num_physical_clients = len(device_info_map)
     active_clients = list(range(num_physical_clients))
 
@@ -274,9 +274,9 @@ if __name__ == '__main__':
     COMPUTE_CAPABILITY = {
         'orin': 1.0,
         'xavier': 0.55,
-        'nano': 0.076 
+        'nano': 0.076
     }
-    
+
     # 3. 初始化 Client 状态
     client_states = {}
     # 定义 ID 到类型的映射，方便查表
@@ -287,10 +287,10 @@ if __name__ == '__main__':
         elif i == 8 or i == 7: t = 'xavier'
         else: t = 'nano'
         id_to_type[i] = t
-        
+
         client_states[i] = {
             'C': COMPUTE_CAPABILITY[t],
-            'E': 1.0, 
+            'E': 1.0,
             'L': 0.0 # 稍后填充
         }
 
@@ -342,7 +342,7 @@ if __name__ == '__main__':
     # ================= [初始化] =================
     set_random_seed(args.seed)
     dataset_train, dataset_test, dict_users = get_dataset(args)
-    
+
     # 填充 L
     max_data_len = max([len(dict_users[i]) for i in range(num_physical_clients)])
     for idx in client_states:
@@ -353,7 +353,7 @@ if __name__ == '__main__':
     net_glob = shfl_resnet18(num_classes=args.num_classes)
     net_glob.apply(init_weights)
     net_glob.to(args.device)
-    
+
     # [DEBUG] 打印模型的key结构
     logger.info("=" * 60)
     logger.info("Global Model Keys:")
@@ -363,7 +363,7 @@ if __name__ == '__main__':
     for k in list(net_glob.state_dict().keys())[-5:]:
         logger.info(f"  {k}")
     logger.info("=" * 60)
-    
+
     # ================= [RL Agent 初始化] =================
     try:
         rl_agent = SHFLAgentManager(n_agents=num_physical_clients, model_dir='./SHFL_model/')
@@ -374,7 +374,7 @@ if __name__ == '__main__':
 
     summary_acc_test_collect = []
     time_collect = []
-    
+
     logger.info(f"🔌 Server listening for {num_physical_clients} clients...")
     connectHandler = ConnectHandler(num_physical_clients, args.HOST, args.POST)
 
@@ -394,7 +394,7 @@ if __name__ == '__main__':
             net_glob.load_state_dict(checkpoint['model_state_dict'])
             summary_acc_test_collect = checkpoint['acc_history']
             start_round = checkpoint['round'] + 1
-            
+
             # [SHFL特有] 恢复client状态和电量
             if 'active_clients' in checkpoint:
                 active_clients = checkpoint['active_clients']
@@ -404,7 +404,7 @@ if __name__ == '__main__':
                 client_battery_joules[idx] = restored_j
                 client_states[idx]['E'] = normalize_battery(idx, restored_j)
             logger.info("  Restored client battery levels")
-            
+
             # [SHFL特有] 恢复RL Agent状态
             if 'rl_agent_state' in checkpoint:
                 try:
@@ -412,7 +412,7 @@ if __name__ == '__main__':
                     logger.info(f"  Restored RL Agent state")
                 except Exception as e:
                     logger.warning(f"  Failed to restore RL Agent: {e}. Will retrain.")
-            
+
             logger.success(f"✅ Successfully resumed from Round {start_round}!")
             last_acc = summary_acc_test_collect[-1]
             if isinstance(last_acc, list):
@@ -519,14 +519,14 @@ if __name__ == '__main__':
         logger.info(f"\n{'='*60}")
         logger.info(f"🕐 Round {iter} Start Time: {round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]}")
         logger.info(f"{'='*60}")
-        
+
         if not active_clients:
             logger.critical("🪫 All clients have run out of battery.")
             break
-            
+
         logger.info(f"🔋 Active Clients Pool: {len(active_clients)}")
-        current_m = min(target_m, len(active_clients))    
-        
+        current_m = min(target_m, len(active_clients))
+
         # 1. 准备 RL 输入
         observations = []
         device_types = []
@@ -540,15 +540,15 @@ if __name__ == '__main__':
                 observations.append(dead)
             # 添加设备类型信息
             device_types.append(id_to_type[i])
-        
+
         # 2. RL 决策 (传入设备类型)
         decisions = rl_agent.select_models(observations, device_types, round_num=iter)
-        
+
         # 3. Top-K 筛选
         valid_decisions = [d for d in decisions if d['client_idx'] in active_clients]
         valid_decisions.sort(key=lambda x: x['q_value'], reverse=True)
         top_k = valid_decisions[:current_m]
-        
+
         idxs_users = []
         client_model_map = {}
         for d in top_k:
@@ -557,7 +557,7 @@ if __name__ == '__main__':
             client_model_map[c_idx] = d['action'] # Model 1-4
 
         idxs_users = np.array(idxs_users)
-        
+
         print(f"\n{'='*60}")
         print(f"Round {iter}: RL Top-{current_m}")
         print(f"Selection: {idxs_users}")
@@ -575,11 +575,11 @@ if __name__ == '__main__':
         successful_indices = []
         for idx in idxs_users:
             model_idx = client_model_map[idx]
-            
+
             msg = dict()
             # [🔥 修正] 使用 shfl_distribute
             w_local_slice = shfl_distribute(net_glob.state_dict(), model_idx)
-            
+
             msg['net'] = w_local_slice
             msg['model_idx'] = model_idx
             msg['idxs_list'] = dict_users[idx]
@@ -587,9 +587,9 @@ if __name__ == '__main__':
             msg['round'] = iter
             msg['battery_joules'] = client_battery_joules[idx]
             msg['battery_ratio'] = client_states[idx]['E']
-            
+
             logger.info(f"📤 Send to Client {idx} (Model-{model_idx})")
-            
+
             if connectHandler.sendData(idx, msg):
                 successful_indices.append(idx)
             else:
@@ -600,10 +600,10 @@ if __name__ == '__main__':
         w_local_client = []
         model_indices_this_round = []
         sleeping_clients_this_round = set()
-        
+
         responses_received = 0
         expected_responses = len(successful_indices)
-        
+
         while responses_received < expected_responses:
             try:
                 msg, client_idx = connectHandler.receiveData()
@@ -612,7 +612,7 @@ if __name__ == '__main__':
                 responses_received += 1
                 continue
             responses_received += 1
-            
+
             if 'battery_joules' in msg:
                 client_battery_joules[client_idx] = min(
                     max(float(msg['battery_joules']), 0.0),
@@ -633,7 +633,7 @@ if __name__ == '__main__':
                     f"{client_battery_joules[client_idx]:.2f} J "
                     f"({client_states[client_idx]['E'] * 100:.2f}%)"
                 )
-            
+
             if msg['type'] == 'status' and msg.get('status') == 'low_battery':
                 logger.warning(f"🪫 Client {client_idx} Low Battery.")
                 retired_clients.add(client_idx)
@@ -654,19 +654,19 @@ if __name__ == '__main__':
             # [🔥 修正] 使用 shfl_aggregate
             w_glob = shfl_aggregate(w_local_client, model_indices_this_round, net_glob)
             net_glob.load_state_dict(w_glob, strict=False)
-        
+
         # 8. 校准与评估
         net_glob_calibrated = stats(dataset_train, net_glob, args)
         net_glob.load_state_dict(net_glob_calibrated.state_dict(), strict=False)
-        
+
         # 评估所有模型
         acc_list = summary_evaluate(net_glob, dataset_test, args.device)  # [acc1, acc2, acc3, acc4]
         summary_acc_test_collect.append(acc_list)
-        
+
         # 记录本轮结束时间和持续时长
         round_end_time = datetime.datetime.now()
         round_duration = (round_end_time - round_start_time).total_seconds()
-        
+
         print("\n" + "="*60)
         print(f"📊 Round {iter} Accuracy Results:")
         print(f"   Model 1 (After Block 0): {acc_list[0]:.2f}%")
@@ -675,20 +675,20 @@ if __name__ == '__main__':
         print(f"   Model 4 (After Block 3): {acc_list[3]:.2f}%")
         print(f"🕐 Round Duration: {round_duration:.2f}s")
         print("="*60 + "\n")
-        
+
         # 输出CSV格式数据，方便后续分析
         logger.info(f"RESULT_CSV,{iter},{acc_list[0]:.2f},{acc_list[1]:.2f},{acc_list[2]:.2f},{acc_list[3]:.2f},"
                    f"{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},"
                    f"{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
 
         client_runtime_state = build_runtime_state_snapshot(sleeping_clients_this_round)
-        
+
         # ==========================================
         # [新增] 断点续训 - 保存 Checkpoint
         # ==========================================
         checkpoint_path = "checkpoint_shfl.pth"
         checkpoint_path_tmp = checkpoint_path + ".tmp"  # 先写临时文件，防止保存时崩溃导致文件损坏
-        
+
         state = {
             'round': iter,
             'model_state_dict': net_glob.state_dict(),
@@ -707,7 +707,7 @@ if __name__ == '__main__':
             # [SHFL特有] 保存RL Agent状态
             'rl_agent_state': rl_agent.get_state() if hasattr(rl_agent, 'get_state') else None,
         }
-        
+
         try:
             torch.save(state, checkpoint_path_tmp)
             os.replace(checkpoint_path_tmp, checkpoint_path)  # 原子操作，避免文件损坏
@@ -717,15 +717,15 @@ if __name__ == '__main__':
 
     # 保存结果
     acc_array = np.array(summary_acc_test_collect)  # Shape: (num_rounds, 4)
-    
+
     # 保存为 numpy 数组（方便分析）
     np.save('shfl_acc_all_models.npy', acc_array)
     logger.info(f"💾 Saved all models accuracy to shfl_acc_all_models.npy (shape: {acc_array.shape})")
-    
+
     # 分别保存每个模型的结果
     for model_idx in range(4):
         model_acc_list = acc_array[:, model_idx].tolist()
         save_result(model_acc_list, f'shfl_acc_model{model_idx+1}', args)
-    
+
     # 保存最深模型（Model-4）作为主结果（向后兼容）
     save_result(acc_array[:, 3].tolist(), 'shfl_acc', args)

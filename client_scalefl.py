@@ -18,7 +18,7 @@ from utils.set_seed import set_random_seed
 
 # [关键修改 1] 引入 ScaleFL 组件
 # 我们需要直接引用 ResNet 类和 BasicBlock，以便手动构建非标准深度的模型
-from models.scalefl_resnet import ResNet, BasicBlock 
+from models.scalefl_resnet import ResNet, BasicBlock
 from models.scalefl_modelutils import KDLoss
 
 # [新增] 引入 BatteryManager 和 休眠模块
@@ -29,24 +29,24 @@ torch.backends.cudnn.deterministic = True
 
 def build_local_model(args, rate, exit_idx, global_ee_locs):
     # 1. 定义 ResNet18 的标准层结构
-    full_layers_config = [2, 2, 2, 2] 
-    
+    full_layers_config = [2, 2, 2, 2]
+
     # 2. 截断层结构
     local_layers = full_layers_config[:exit_idx + 1]
-    
+
     # 3. 计算本地模型的总层数
     local_total_layers = sum(local_layers)
-    
+
     # 4. 关键修改：Client 端的过滤逻辑
     # 我们需要保留所有 <= 本地总层数的 Exit
     # 对于 Xavier (total=6): [2, 4, 6] 都要保留！
     # 2->Block0, 4->Block1, 6->Block2(作为最终输出)
     # local_ee_locs = [loc for loc in global_ee_locs if loc <= local_total_layers]
-    
+
     # ⚠️ 4. 关键修改：确定是否为全量模型
     # 如果 exit_idx 是最后一个 (3)，就是 Full Model
     is_full_model = (exit_idx == len(full_layers_config) - 1)
-    
+
     # ⚠️ 5. 关键修改：计算 EE Locations
     if is_full_model:
         # 如果是全量，按原逻辑，小于总层数的都是 EE，最后的是 Linear
@@ -61,16 +61,16 @@ def build_local_model(args, rate, exit_idx, global_ee_locs):
 
     logger.info(f"Building Local Model: Rate={rate}, Exit_Idx={exit_idx}")
     logger.info(f" -> Layers: {local_layers}, EE_Locs: {local_ee_locs}, Is_Full: {is_full_model}")
-    
+
     trs = bool(args.track_running_stats)
-    
+
     # 实例化
     model = ResNet(
-        BasicBlock, 
-        layers=local_layers, 
-        num_classes=args.num_classes, 
-        ee_layer_locations=local_ee_locs, 
-        scale=rate, 
+        BasicBlock,
+        layers=local_layers,
+        num_classes=args.num_classes,
+        ee_layer_locations=local_ee_locs,
+        scale=rate,
         trs=trs,
         is_full_model=is_full_model  # 传入新参数
     )
@@ -79,11 +79,11 @@ def build_local_model(args, rate, exit_idx, global_ee_locs):
 if __name__ == '__main__':
     args = args_parser()
     args.device = torch.device('cuda:{}'.format(args.gpu) if torch.cuda.is_available() and args.gpu != -1 else 'cpu')
-    
+
     # [关键参数补全] 如果 options.py 里没加这两个参数，这里给默认值
     if not hasattr(args, 'KD_T'): args.KD_T = 4.0   # 温度系数
     if not hasattr(args, 'KD_gamma'): args.KD_gamma = 0.5 # 蒸馏权重
-    
+
     set_random_seed(args.seed)
 
     # ========== [🔥 电池模拟 Step 1: 初始化] ==========
@@ -95,23 +95,23 @@ if __name__ == '__main__':
         # 0-6 默认 nano
     }
     device_type = DEVICE_TYPE_MAP.get(args.CID, 'nano')
-    
+
     # 2. 实例化电池管理器
     battery_manager = BatteryManager(device_type=device_type)
 
     ID = args.CID
     logger.info(f"Client {ID} ({device_type}) starting...")
-    
+
     # 获取数据
     dataset_train, dataset_test, dict_users = get_dataset(args)
-    
+
     # 原代码逻辑: connectHandler = ConnectHandler(args.HOST, args.POST, ID)
     connectHandler = ConnectHandler(args.HOST, args.POST, ID)
-    
+
     # 初始化 Loss
     # ScaleFL 使用 KDLoss (包含 CE 和 KL)
     criterion = KDLoss(args).to(args.device)
-    
+
     local_model = None
     optimizer = None
 
@@ -141,7 +141,7 @@ if __name__ == '__main__':
                         battery_manager.set_charge(float(recv['battery_level']) * battery_manager.total_capacity)
                 battery_manager.consume('idle', idle_duration)
                 battery_state_synced = True
-            battery_manager.consume('communication', recv_duration) 
+            battery_manager.consume('communication', recv_duration)
 
             if recv and recv['type'] == 'net':
                 # ========================================================
@@ -149,7 +149,7 @@ if __name__ == '__main__':
                 # ========================================================
                 if not battery_manager.check_energy(threshold=50.0):
                     logger.warning(f"🪫 Client {ID} battery critical (<50J). Initiating shutdown protocol.")
-                    
+
                     # 1. 发送退出通知
                     msg = {'type': 'status', 'status': 'low_battery'}
                     msg['battery_joules'] = battery_manager.get_charge()
@@ -157,17 +157,17 @@ if __name__ == '__main__':
                     upload_start = time.time()
                     connectHandler.uploadToServer(msg)
                     battery_manager.consume('communication', time.time() - upload_start)
-                    
+
                     # 2. 等待 Server 确认 (ACK)
                     logger.info("⏳ Waiting for server confirmation to shutdown...")
                     ack = connectHandler.receiveFromServer()
-                    
+
                     if ack and ack.get('type') == 'shutdown_ack':
                         logger.success("✅ Server acknowledged shutdown. Powering off.")
                     else:
                         logger.warning("⚠️ No ACK received or unknown message, forcing shutdown.")
-                    
-                    # 3. 退出脚本 
+
+                    # 3. 退出脚本
                     os.system("sudo poweroff")
                     break
 
@@ -178,15 +178,15 @@ if __name__ == '__main__':
                 round_num = recv['round']
                 w_local_state_dict = recv['net']
                 idxs_list = recv['idxs_list']
-                
+
                 # 获取 ScaleFL 特定参数
                 rate = recv.get('rate', 1.0)
                 exit_idx = recv.get('exit_idx', 3) # 默认全深
                 global_ee_locs = recv.get('global_ee_locs', [2, 4, 6])
-                
+
                 # 2. 实例化本地模型 (动态构建)
                 local_model = build_local_model(args, rate, exit_idx, global_ee_locs)
-                
+
                 # 3. 加载参数
                 try:
                     # strict=True 是对 ScaleFL 正确性的终极检验
@@ -203,31 +203,31 @@ if __name__ == '__main__':
                 dtLoader = DataLoader(DatasetSplit(dataset_train, idxs_list),
                                     batch_size=args.bs, shuffle=True)
                 local_model.train()
-                optimizer = torch.optim.SGD(local_model.parameters(), 
+                optimizer = torch.optim.SGD(local_model.parameters(),
                                             lr=args.lr * (args.lr_decay ** round_num),
-                                            momentum=args.momentum, 
+                                            momentum=args.momentum,
                                             weight_decay=args.weight_decay)
 
                 # 5. 训练循环 (带自蒸馏)
                 # ========== [状态 3: 训练] ==========
                 train_start_time = time.time()
                 epoch_loss = []
-                
+
                 logger.info(f"Starting training for {args.local_ep} epochs...")
 
                 for epoch in range(args.local_ep):
                     batch_loss = []
-                    
+
                     # [🔥 新增] 使用 tqdm 显示进度条
                     pbar = tqdm(dtLoader, desc=f"Epoch {epoch+1}/{args.local_ep}", unit="batch")
-                    
+
                     for batch_idx, (images, labels) in enumerate(pbar):
                         images, labels = images.to(args.device), labels.to(args.device)
                         optimizer.zero_grad()
-                        
+
                         # ScaleFL Forward: 返回列表 [exit_0_out, exit_1_out, ..., final_out]
                         outputs = local_model(images)
-                        
+
                         # [🔥 关键修复] 只有一个出口时不做自蒸馏
                         if len(outputs) == 1:
                             # Nano 等只有单个出口的设备，使用标准 CE Loss
@@ -235,31 +235,31 @@ if __name__ == '__main__':
                         else:
                             # Xavier/Orin 等多出口设备，使用自蒸馏
                             # 最后一个输出作为 Teacher (Soft Target)
-                            teacher_output = outputs[-1].detach() 
-                            
+                            teacher_output = outputs[-1].detach()
+
                             loss = 0.0
                             # 遍历所有出口
                             for i, output in enumerate(outputs):
                                 # 如果是最后一个出口(Teacher本身)，只算 CrossEntropy，不算 KL (gamma_active=False)
                                 is_teacher = (i == len(outputs) - 1)
-                                
+
                                 # 调用 KDLoss
                                 # loss_fn_kd(pred, target, soft_target, gamma_active)
                                 # 注意：ScaleFL 论文中所有 exit 都要算 CE Loss
                                 l = criterion.loss_fn_kd(output, labels, teacher_output, gamma_active=not is_teacher)
                                 loss += l
-                        
+
                         loss.backward()
-                        
+
                         # [🔥 梯度裁剪] 防止极端non-IID导致的梯度爆炸
                         torch.nn.utils.clip_grad_norm_(local_model.parameters(), max_norm=1.0)
-                        
+
                         optimizer.step()
                         batch_loss.append(loss.item())
-                        
+
                         # [🔥 新增] 更新进度条显示的 Loss
                         pbar.set_postfix({'loss': f'{loss.item():.4f}'})
-                    
+
                     avg_epoch_loss = sum(batch_loss)/len(batch_loss)
                     epoch_loss.append(avg_epoch_loss)
                     # [🔥 新增] 每个 Epoch 结束打印汇总
@@ -280,19 +280,19 @@ if __name__ == '__main__':
                 msg['rate'] = rate # 回传 rate 方便 Server 聚合
                 msg['battery_joules'] = battery_manager.get_charge()
                 msg['battery_level'] = battery_manager.get_ratio()
-    
+
                 # ========== [🔥 电池模拟 Step 5: 计算上传功耗] ==========
                 upload_start_time = time.time()
                 logger.info(f"📤 [Client {ID}] Uploading model...")
                 connectHandler.uploadToServer(msg)
-                
+
                 # [🔥 新增: 等待 Server 确认接收]
                 logger.info("⏳ Waiting for server confirmation (ACK)...")
                 ack_msg = connectHandler.receiveFromServer()
-                
+
                 upload_duration = time.time() - upload_start_time
                 battery_manager.consume('communication', upload_duration)
-                
+
                 if ack_msg and ack_msg.get('type') == 'upload_ack':
                     logger.success(f"✅ [Client {ID}] Server confirmed receipt. Preparing to sleep.")
                 else:
@@ -300,18 +300,18 @@ if __name__ == '__main__':
 
 
                 # ========================================
-                
+
                 # 记录休眠前的时间戳
                 last_timestamp = time.time()
 
                 # ========== [状态 5: 休眠] ==========
                 smart_sleep(server_ip=args.HOST)
-                
+
                 # 唤醒后，计算休眠功耗
                 wake_up_time = time.time()
                 sleep_duration = wake_up_time - last_timestamp
                 battery_manager.consume('sleep', sleep_duration)
-                
+
                 # 更新时间戳，用于计算下一次 idle
                 last_timestamp = wake_up_time
 

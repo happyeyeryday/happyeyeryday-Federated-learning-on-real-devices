@@ -35,7 +35,7 @@ class ConnectHandler(object):
     #     # logger.info("sending data ({} bytes) to client completely", length)
     #     try:
     #     # 设置发送超时
-            
+
     #         binary_data = pickle.dumps(data)
     #         len_data = len(binary_data).to_bytes(8, byteorder="big")
     #         length = len(binary_data)
@@ -43,7 +43,7 @@ class ConnectHandler(object):
     #         binary_data = len_data + binary_data
 
     #         logger.info("开始发送数据 ({} bytes)...", length)
-            
+
     #         # 分块发送大数据
     #         chunk_size = 1024 * 1024  # 1MB
     #         sent = 0
@@ -53,12 +53,12 @@ class ConnectHandler(object):
     #             # 实时显示进度
     #             progress = (sent / len(binary_data)) * 100
     #             logger.info("已发送: {:.1f}% ({}/{} bytes)", progress, sent, len(binary_data))
-                
+
     #         logger.info("数据发送完成 ({} bytes)", length)
-            
+
     #         # 恢复默认无超时
     #         self.socket.settimeout(None)
-            
+
     #     except socket.timeout:
     #         logger.error("发送数据超时！请检查服务器状态")
     #         raise
@@ -74,7 +74,7 @@ class ConnectHandler(object):
             binary_data = pickle.dumps(data)
             length = len(binary_data)
             len_data = length.to_bytes(8, byteorder="big")
-            
+
             # 先发送数据长度
             self.socket.sendall(len_data)
 
@@ -83,7 +83,7 @@ class ConnectHandler(object):
 
             # 使用 sendall 来保证所有数据都被发送，这是最简单可靠的方式
             self.socket.sendall(binary_data)
-            
+
             # === 探针 #C: 确认所有数据都已提交给操作系统缓冲区 ===
             # 注意：这仍然不代表服务器已接收完毕，但代表客户端的工作已完成。
             logger.success(f"所有数据 ({length} bytes) 已成功提交给网络缓冲区。uploadToServer 函数即将返回。")
@@ -92,7 +92,7 @@ class ConnectHandler(object):
             logger.error("在 uploadToServer 中发生严重错误: {}", e)
             # 可以在这里加入重连或退出的逻辑
             raise
-        
+
     def uploadToServerWithRateLimit(self, data, rate):
         binary_data = pickle.dumps(data)
         len_data = len(binary_data).to_bytes(8, byteorder="big")

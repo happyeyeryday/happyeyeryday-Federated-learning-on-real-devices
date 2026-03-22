@@ -197,7 +197,7 @@ class Three_ResNet_ALL(nn.Module):
         bottlenecks = []
         fcs = []
         self.n_models = n_models
-        
+
         # [🔥 关键修复] 分别构建mainblocks和bottlenecks，避免in_planes累积错误
         # 先构建所有mainblocks
         temp_in_planes = 64
@@ -205,7 +205,7 @@ class Three_ResNet_ALL(nn.Module):
             self.in_planes = temp_in_planes  # 重置为当前应该的输入维度
             mainblocks.append(self._make_resblocklayer(block, planes[i], num_blocks[i], strides[i]))
             temp_in_planes = self.in_planes  # 记录mainblock的输出维度
-        
+
         # 然后基于mainblock的输出维度构建bottlenecks
         # mainblock输出维度：64, 128, 256, 512
         bottleneck_input_dims = [64, 128, 256, 512]
@@ -213,7 +213,7 @@ class Three_ResNet_ALL(nn.Module):
             self.in_planes = bottleneck_input_dims[i]
             bottlenecks.append(self._make_bottlenecklayer(block, num_classes, branch_layers[i], 2))
             fcs.append(nn.Linear(512 * block.expansion, num_classes, bias=is_bias))
-            
+
         self.mainblocks = nn.ModuleList(mainblocks)
         self.bottlenecks = nn.ModuleList(bottlenecks)
         self.fcs = nn.ModuleList(fcs)
@@ -384,7 +384,7 @@ def shfl_resnet18(num_classes=10, model_idx=None):
     """
     SHFL 论文使用的 ResNet18 (基于 BYOT 结构)
     默认配置: 4 个分支 (Model-1 to Model-4)
-    
+
     Args:
         num_classes: 分类数量
         model_idx: 模型深度索引 (1-4)，如果为None则返回Server全局模型(ALL)
@@ -394,13 +394,13 @@ def shfl_resnet18(num_classes=10, model_idx=None):
     # Block1 -> Exit1 (Model-2)
     # Block2 -> Exit2 (Model-3)
     # Block3 -> Exit3 (Model-4)
-    
+
     # 如果指定了model_idx，返回Client端单exit模型
     if model_idx is not None:
         return _10_3_ResNet18_byot(n_models=model_idx)
-    
+
     # Server端返回多exit全局模型 (包含4个独立的bottlenecks和fcs)
-    return _10_3_ResNet18_byot_ALL() 
+    return _10_3_ResNet18_byot_ALL()
 
 
 if __name__ == '__main__':

@@ -13,7 +13,7 @@ cfg = {
     'norm': 'bn',          # 使用 Batch Norm (配合 track 实现 sBN)
     'scale': True,         # 启用 Scaler
     'mask': False,         # 暂时关闭 Mask 逻辑，简化流程
-    'global_model_rate': 1.0, 
+    'global_model_rate': 1.0,
     'data_shape': [3, 32, 32], # CIFAR-10 尺寸
     'classes_size': 10,        # CIFAR-10 类别数
     'resnet': {
@@ -63,7 +63,7 @@ class Block(nn.Module):
         self.conv1 = nn.Conv2d(in_planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.n2 = n2
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=1, padding=1, bias=False)
-        
+
         # Scaler 逻辑
         if cfg['scale']:
             self.scaler = Scaler(rate)
@@ -99,7 +99,7 @@ class Bottleneck(nn.Module):
         self.conv2 = nn.Conv2d(planes, planes, kernel_size=3, stride=stride, padding=1, bias=False)
         self.n3 = n3
         self.conv3 = nn.Conv2d(planes, self.expansion * planes, kernel_size=1, bias=False)
-        
+
         if cfg['scale']:
             self.scaler = Scaler(rate)
         else:
@@ -129,18 +129,18 @@ class ResNet(nn.Module):
         self.layer2 = self._make_layer(block, hidden_size[1], num_blocks[1], stride=2, rate=rate, track=track)
         self.layer3 = self._make_layer(block, hidden_size[2], num_blocks[2], stride=2, rate=rate, track=track)
         self.layer4 = self._make_layer(block, hidden_size[3], num_blocks[3], stride=2, rate=rate, track=track)
-        
+
         if cfg['norm'] == 'bn':
             n4 = nn.BatchNorm2d(hidden_size[3] * block.expansion, momentum=None, track_running_stats=track)
         else:
             n4 = nn.Identity()
         self.n4 = n4
-        
+
         if cfg['scale']:
             self.scaler = Scaler(rate)
         else:
             self.scaler = nn.Identity()
-            
+
         self.linear = nn.Linear(hidden_size[3] * block.expansion, num_classes)
 
     def _make_layer(self, block, planes, num_blocks, stride, rate, track):
@@ -162,7 +162,7 @@ class ResNet(nn.Module):
         out = F.adaptive_avg_pool2d(out, 1)
         out = out.view(out.size(0), -1)
         out = self.linear(out)
-        
+
         # [修改] 直接返回 tensor，方便计算 Loss
         return out
 
@@ -176,7 +176,7 @@ def resnet18(model_rate=1, track=False):
     # 动态计算 Hidden Size
     hidden_size = [int(np.ceil(model_rate * x)) for x in cfg['resnet']['hidden_size']]
     scaler_rate = model_rate / cfg['global_model_rate']
-    
+
     model = ResNet(data_shape, hidden_size, Block, [2, 2, 2, 2], classes_size, scaler_rate, track)
     model.apply(init_param)
     return model

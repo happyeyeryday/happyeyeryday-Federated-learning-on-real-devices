@@ -92,12 +92,12 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
     y_train = np.array(train_data.targets)
     N_train = len(y_train)
     K = num_classes
-    
+
     # 1. 定义目标配额 (Quota)
     target_quotas = np.zeros(num_clients, dtype=int)
     nano_ids = list(range(0, 7))       # 0-6
     powerful_ids = list(range(7, 10))  # 7, 8, 9
-    
+
     target_quotas[nano_ids] = 2000
     remaining_data = N_train - sum(target_quotas[nano_ids])
     # Xavier 和 Orin 平分剩下的 36000
@@ -105,24 +105,24 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
     target_quotas[powerful_ids] = avg_powerful
     target_quotas[9] += (remaining_data % len(powerful_ids)) # 余数给 Orin
     MIN_CLASSES = 3
-    
+
     MAX_RETRIES = 50
     retry_count = 0
-    
+
     dict_users_train = {}
 
     while retry_count < MAX_RETRIES:
         dict_users_train = {i: [] for i in range(num_clients)}
         current_counts = np.zeros(num_clients, dtype=int)
-        
+
         # 3. 按类别进行分配
         for k in range(K):
             idx_k = np.where(y_train == k)[0]
             np.random.shuffle(idx_k)
-            
+
             # 生成 Dirichlet 比例
             proportions = np.random.dirichlet(np.repeat(beta, num_clients))
-            
+
             # 软约束：根据剩余容量调整比例
             mask = np.ones(num_clients)
             for i in range(num_clients):
@@ -131,7 +131,7 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
                     mask[i] = 0
                 elif current_counts[i] / target_quotas[i] > 0.95:
                     mask[i] = 0.1 # 接近满时，降低获取新数据的概率
-            
+
             proportions = proportions * mask
             if proportions.sum() > 0:
                 proportions /= proportions.sum()
@@ -143,13 +143,13 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
             # 计算各设备分多少
             count_k = len(idx_k)
             actual_counts_k = (proportions * count_k).astype(int)
-            
+
             # 确保 Nano 绝不越界
             for i in nano_ids:
                 rem = target_quotas[i] - current_counts[i]
                 if actual_counts_k[i] > rem:
                     actual_counts_k[i] = rem
-            
+
             # 处理溢出：将剩下的数据给强大的设备
             allocated = sum(actual_counts_k)
             surplus = count_k - allocated
@@ -161,7 +161,7 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
                         actual_counts_k[p_id] += add_num
                         surplus -= add_num
                         if surplus <= 0: break
-            
+
             # 实际执行切分并存入字典
             split_points = np.cumsum(actual_counts_k)[:-1]
             for i, idx_list in enumerate(np.split(idx_k, split_points)):
@@ -170,7 +170,7 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
 
         # 验证类别数量
         min_classes_found = min([len(np.unique(y_train[dict_users_train[i]])) for i in range(num_clients)])
-        
+
         if min_classes_found >= MIN_CLASSES:
             break
         else:
@@ -183,14 +183,14 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
     for i in nano_ids:
         current_size = len(dict_users_train[i])
         diff = target_quotas[i] - current_size
-        
+
         if diff > 0:  # Nano 需要补充数据
             # 按类别比例从powerful设备"借"数据
             needed_per_class = {}
             for cls in range(K):
                 cls_count = sum([1 for idx in dict_users_train[i] if y_train[idx] == cls])
                 needed_per_class[cls] = max(1, int(diff * cls_count / max(current_size, 1)))
-            
+
             for cls, needed in needed_per_class.items():
                 transferred = 0
                 for donor in powerful_ids:
@@ -199,17 +199,17 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
                     # 从donor中找属于cls的样本
                     donor_cls_indices = [idx for idx in dict_users_train[donor] if y_train[idx] == cls]
                     transfer_count = min(needed - transferred, len(donor_cls_indices), len(dict_users_train[donor]) - target_quotas[donor] + 100)
-                    
+
                     for _ in range(transfer_count):
                         if donor_cls_indices:
                             sample_idx = donor_cls_indices.pop()
                             dict_users_train[donor].remove(sample_idx)
                             dict_users_train[i].append(sample_idx)
                             transferred += 1
-                
+
                 if len(dict_users_train[i]) >= target_quotas[i]:
                     break
-        
+
         elif diff < 0:  # Nano 数据过多（罕见）
             # 转移多余数据给powerful设备
             excess = -diff
@@ -221,7 +221,7 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
     # 5. 打乱每个客户端的数据（保证可复现性）
     for i in range(num_clients):
         np.random.shuffle(dict_users_train[i])
-    
+
     # 6. 打印审计报告（包含类别分布统计）
     print("\n" + "═" * 25 + " 数据分配最终审计 " + "═" * 25)
     total_samples = 0
@@ -229,21 +229,21 @@ def separate_data(train_data, num_clients, num_classes, beta=0.4):
         dtype = "Nano" if i in nano_ids else ("Xavier" if i in [7, 8] else "Orin")
         client_indices = dict_users_train[i]
         num_cls = len(np.unique(y_train[client_indices]))
-        
+
         # 计算类别分布的不均衡度（标准差）
         cls_counts = [sum([1 for idx in client_indices if y_train[idx] == c]) for c in range(K)]
         cls_std = np.std(cls_counts)
-        
+
         status = "✅" if num_cls >= MIN_CLASSES else "❌"
         total_samples += len(client_indices)
         print(f"{status} ID {i:d} ({dtype:6s}) | 样本: {len(client_indices):5d} | 类别: {num_cls:2d}/{K} | 不均衡度: {cls_std:.1f}")
-    
+
     print(f"Total samples: {total_samples}/{N_train}")
     print("═" * 66 + "\n")
-    
+
     # [可选] 调用详细统计
     # record_net_data_stats(y_train, dict_users_train)
-    
+
     return dict_users_train
 
 def record_net_data_stats(y_train, net_dataidx_map):
