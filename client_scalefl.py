@@ -116,12 +116,14 @@ if __name__ == '__main__':
     optimizer = None
 
     last_timestamp = time.time() # 初始化时间戳
+    battery_state_synced = False
 
     try:
         while True:
             # ========== [状态 1: 空闲等待] ==========
             idle_duration = time.time() - last_timestamp
-            battery_manager.consume('idle', idle_duration)
+            if battery_state_synced:
+                battery_manager.consume('idle', idle_duration)
 
             # ========== [状态 2: 接收数据] ==========
             recv_start_time = time.time()
@@ -131,6 +133,14 @@ if __name__ == '__main__':
 
             # [更新电量] 计算通讯功耗
             recv_duration = time.time() - recv_start_time
+            if not battery_state_synced:
+                if recv and recv['type'] == 'net':
+                    if 'battery_joules' in recv:
+                        battery_manager.set_charge(recv['battery_joules'])
+                    elif 'battery_level' in recv:
+                        battery_manager.set_charge(float(recv['battery_level']) * battery_manager.total_capacity)
+                battery_manager.consume('idle', idle_duration)
+                battery_state_synced = True
             battery_manager.consume('communication', recv_duration) 
 
             if recv and recv['type'] == 'net':
@@ -142,6 +152,8 @@ if __name__ == '__main__':
                     
                     # 1. 发送退出通知
                     msg = {'type': 'status', 'status': 'low_battery'}
+                    msg['battery_joules'] = battery_manager.get_charge()
+                    msg['battery_level'] = battery_manager.get_ratio()
                     upload_start = time.time()
                     connectHandler.uploadToServer(msg)
                     battery_manager.consume('communication', time.time() - upload_start)
@@ -266,6 +278,8 @@ if __name__ == '__main__':
                 # 这里的 state_dict 天然只包含 Client 拥有的层
                 msg['net'] = copy.deepcopy(local_model.state_dict())
                 msg['rate'] = rate # 回传 rate 方便 Server 聚合
+                msg['battery_joules'] = battery_manager.get_charge()
+                msg['battery_level'] = battery_manager.get_ratio()
     
                 # ========== [🔥 电池模拟 Step 5: 计算上传功耗] ==========
                 upload_start_time = time.time()

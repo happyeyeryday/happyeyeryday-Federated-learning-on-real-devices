@@ -31,10 +31,13 @@ POWER_CONFIG = {
 
 # [TODO] 在此处填写你为设备模拟的总电量 (单位：焦耳)
 BATTERY_CAPACITY = {
-    'orin': 300000,  # J
-    'xavier': 300000, # J
-    'nano': 300000,   # J
+    'orin': 150000,  # J
+    'xavier': 150000, # J
+    'nano': 150000,   # J
 }
+
+# 设备被 ping 通后，额外等待一段时间让系统/网卡彻底恢复，避免“刚唤醒就下发任务”导致异常。
+WAKE_SETTLE_TIME = int(os.getenv("WAKE_SETTLE_TIME", "8"))
 
 
 class BatteryManager:
@@ -51,6 +54,30 @@ class BatteryManager:
         self.current_charge = float(self.total_capacity) # 当前电量 (J)
 
         logger.info(f"🔋 [Battery] Initialized. Capacity: {self.current_charge} J")
+
+    def set_charge(self, charge_joules: float):
+        """
+        设置当前电量（用于断点续训恢复）。
+        """
+        charge_joules = float(charge_joules)
+        self.current_charge = min(max(charge_joules, 0.0), float(self.total_capacity))
+        logger.info(
+            f"🔄 [Battery] Restored charge from server/checkpoint: "
+            f"{self.current_charge:.2f}/{self.total_capacity} J ({self.get_ratio() * 100:.1f}%)"
+        )
+        return self.current_charge
+
+    def get_charge(self):
+        """
+        获取当前剩余电量（J）。
+        """
+        return float(self.current_charge)
+
+    def get_ratio(self):
+        """
+        获取当前剩余电量比例（0-1）。
+        """
+        return float(self.current_charge) / float(self.total_capacity)
 
     def consume(self, activity: str, duration_seconds: float):
         """
@@ -73,7 +100,7 @@ class BatteryManager:
         # 确保电量不为负
         self.current_charge = max(0, self.current_charge)
         
-        percentage = (self.current_charge / self.total_capacity) * 100
+        percentage = self.get_ratio() * 100
         
         logger.info(
             f"⚡ [Battery] Activity: {activity} ({duration_seconds:.1f}s). "
@@ -178,13 +205,14 @@ def _wait_for_network(server_ip, timeout):
 # Server 端使用的功能
 # ==========================================
 
-def wake_clients(mac_to_ip_map, total_timeout):
+def wake_clients(mac_to_ip_map, total_timeout, settle_time=WAKE_SETTLE_TIME):
     """
     Server 端批量唤醒函数 (主动确认与重试版)。
     
     Args:
         mac_to_ip_map (dict): 字典，{MAC地址: IP地址}
         total_timeout (int): 整个唤醒过程的最大超时时间(秒)。
+        settle_time (int): 全部设备上线后的稳定等待时间(秒)。
     """
     if not mac_to_ip_map:
         return
@@ -235,6 +263,9 @@ def wake_clients(mac_to_ip_map, total_timeout):
     # 3. 最终结果
     if not devices_to_wake:
         logger.success("🎉 [PowerManager] 所有设备已成功唤醒！")
+        if settle_time > 0:
+            logger.info(f"⏸️ [PowerManager] 设备恢复缓冲中，等待 {settle_time}s 后再下发任务...")
+            time.sleep(settle_time)
     else:
         logger.error(f"❌ [PowerManager] 唤醒超时！以下设备未能唤醒:")
         for mac in devices_to_wake:

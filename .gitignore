@@ -1,11 +1,17 @@
 # --- 用户自定义忽略 ---
-deploy_sh/
 log/
 logs/
 checkpoints/
 client_logs/
 models/SHFL/
 SHFL_model/
+scripts/__pycache__/
+scripts/*.csv
+scripts/*.txt
+scripts/*.xlsx
+scripts/**/*.csv
+scripts/**/*.txt
+scripts/**/*.xlsx
 
 # --- Python 通用忽略 (必须添加) ---
 __pycache__/

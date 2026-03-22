@@ -17,7 +17,7 @@ from utils.options import args_parser
 from utils.set_seed import set_random_seed
 from utils.utils import save_result
 # [新增] 引入电源唤醒模块
-from utils.power_manager import wake_clients
+from utils.power_manager import BATTERY_CAPACITY, wake_clients
 
 # 引入 ScaleFL 模型
 from models.scalefl_resnet import resnet18_scalefl
@@ -295,6 +295,41 @@ if __name__ == '__main__':
             'E': 1.0,  # 初始电量 100%
         }
 
+    def get_device_type(client_id):
+        if client_id == 9:
+            return 'orin'
+        if client_id in [7, 8]:
+            return 'xavier'
+        return 'nano'
+
+    def get_device_capacity(client_id):
+        return float(BATTERY_CAPACITY[get_device_type(client_id)])
+
+    def normalize_battery(client_id, joules):
+        capacity = get_device_capacity(client_id)
+        joules = min(max(float(joules), 0.0), capacity)
+        return joules / capacity
+
+    def restore_battery_from_checkpoint(checkpoint, client_id):
+        if 'battery_state_joules' in checkpoint and client_id in checkpoint['battery_state_joules']:
+            restored = checkpoint['battery_state_joules'][client_id]
+        elif (
+            'client_states' in checkpoint
+            and client_id in checkpoint['client_states']
+            and 'E' in checkpoint['client_states'][client_id]
+        ):
+            legacy_ratio = min(max(float(checkpoint['client_states'][client_id]['E']), 0.0), 1.0)
+            restored = legacy_ratio * get_device_capacity(client_id)
+        else:
+            restored = get_device_capacity(client_id)
+        capacity = get_device_capacity(client_id)
+        return min(max(float(restored), 0.0), capacity)
+
+    client_battery_joules = {
+        i: get_device_capacity(i)
+        for i in range(num_physical_clients)
+    }
+
     # 4. 全局模型配置
     global_model_config = {
         'ee_layer_locations': [2, 4, 6], 
@@ -339,10 +374,11 @@ if __name__ == '__main__':
             if 'active_clients' in checkpoint:
                 active_clients = checkpoint['active_clients']
                 logger.info(f"  Restored active_clients: {active_clients}")
-            if 'client_states' in checkpoint:
-                for idx, state in checkpoint['client_states'].items():
-                    client_states[idx]['E'] = state['E']
-                logger.info(f"  Restored client battery levels")
+            for idx in range(num_physical_clients):
+                restored_j = restore_battery_from_checkpoint(checkpoint, idx)
+                client_battery_joules[idx] = restored_j
+                client_states[idx]['E'] = normalize_battery(idx, restored_j)
+            logger.info("  Restored client battery levels")
             
             logger.success(f"✅ Successfully resumed from Round {start_round}!")
             last_acc = summary_acc_test_collect[-1]
@@ -384,7 +420,7 @@ if __name__ == '__main__':
             device_info_map[idx]['mac']: device_info_map[idx]['ip']
             for idx in idxs_users if idx in device_info_map
         }
-        wake_clients(mac_to_ip_to_wake, total_timeout=20)
+        wake_clients(mac_to_ip_to_wake, total_timeout=20, settle_time=8)
 
         # 下发
         for idx in idxs_users:
@@ -406,6 +442,8 @@ if __name__ == '__main__':
             msg['idxs_list'] = dict_users[idx]
             msg['type'] = 'net'
             msg['round'] = iter
+            msg['battery_joules'] = client_battery_joules[idx]
+            msg['battery_ratio'] = client_states[idx]['E']
             
             logger.info(f"📤 Send to Client {idx} (Rate {current_rate}, Exit {current_exit_idx})")
             
@@ -433,8 +471,16 @@ if __name__ == '__main__':
             responses_received += 1
             
             # [🔥 新增] 更新 Client 电量信息
-            if 'battery_level' in msg:
-                client_states[client_idx]['E'] = msg['battery_level']
+            if 'battery_joules' in msg:
+                client_battery_joules[client_idx] = min(
+                    max(float(msg['battery_joules']), 0.0),
+                    get_device_capacity(client_idx)
+                )
+                client_states[client_idx]['E'] = normalize_battery(client_idx, client_battery_joules[client_idx])
+            elif 'battery_level' in msg:
+                ratio = min(max(float(msg['battery_level']), 0.0), 1.0)
+                client_battery_joules[client_idx] = ratio * get_device_capacity(client_idx)
+                client_states[client_idx]['E'] = ratio
             
             # [处理低电量退出]
             if msg['type'] == 'status' and msg.get('status') == 'low_battery':
@@ -450,7 +496,6 @@ if __name__ == '__main__':
                 
                 if client_idx in active_clients:
                     active_clients.remove(client_idx)
-                    client_states[client_idx]['E'] = 0.0
             
             # [处理正常模型]
             elif msg['type'] == 'net':
@@ -517,6 +562,11 @@ if __name__ == '__main__':
             'time_history': time_collect,
             'active_clients': active_clients,
             'client_states': client_states,
+            'battery_state_joules': client_battery_joules,
+            'battery_state_ratio': {
+                idx: normalize_battery(idx, client_battery_joules[idx])
+                for idx in client_battery_joules
+            },
         }
         
         try:

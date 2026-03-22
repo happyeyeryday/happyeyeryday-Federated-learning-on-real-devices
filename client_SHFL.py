@@ -69,12 +69,14 @@ if __name__ == '__main__':
     optimizer = None
 
     last_timestamp = time.time() # 初始化时间戳
+    battery_state_synced = False
 
     try:
         while True:
             # ========== [状态 1: 空闲等待] ==========
             idle_duration = time.time() - last_timestamp
-            battery_manager.consume('idle', idle_duration)
+            if battery_state_synced:
+                battery_manager.consume('idle', idle_duration)
 
             # ========== [状态 2: 接收数据] ==========
             recv_start_time = time.time()
@@ -83,7 +85,35 @@ if __name__ == '__main__':
             recv = connectHandler.receiveFromServer()
 
             recv_duration = time.time() - recv_start_time
+            if not battery_state_synced and recv and ('battery_joules' in recv or 'battery_level' in recv):
+                if 'battery_joules' in recv:
+                    battery_manager.set_charge(recv['battery_joules'])
+                elif 'battery_level' in recv:
+                    battery_manager.set_charge(float(recv['battery_level']) * battery_manager.total_capacity)
+                battery_state_synced = True
+                last_timestamp = time.time()
             battery_manager.consume('communication', recv_duration) 
+
+            if recv and recv['type'] == 'sync_state':
+                runtime_state = recv.get('runtime_state', 'waiting')
+                logger.info(f"Received sync state from server: {runtime_state}")
+
+                if runtime_state == 'retired':
+                    logger.warning(f"Client {ID} is marked retired in checkpoint state. Powering off.")
+                    os.system("sudo poweroff")
+                    break
+
+                if runtime_state == 'sleeping':
+                    logger.info(f"Client {ID} restoring sleep state before resuming training.")
+                    last_timestamp = time.time()
+                    smart_sleep(server_ip=args.HOST)
+                    wake_up_time = time.time()
+                    sleep_duration = wake_up_time - last_timestamp
+                    battery_manager.consume('sleep', sleep_duration)
+                    last_timestamp = wake_up_time
+                else:
+                    last_timestamp = time.time()
+                continue
 
             if recv and recv['type'] == 'net':
                 # ========================================================
@@ -95,7 +125,8 @@ if __name__ == '__main__':
                     # 1. 发送退出通知
                     msg = {'type': 'status', 'status': 'low_battery'}
                     # 附带当前电量信息 (虽然要退出了，但也发一下)
-                    msg['battery_level'] = battery_manager.current_charge / battery_manager.total_capacity
+                    msg['battery_joules'] = battery_manager.get_charge()
+                    msg['battery_level'] = battery_manager.get_ratio()
                     
                     upload_start = time.time()
                     connectHandler.uploadToServer(msg)
@@ -193,7 +224,8 @@ if __name__ == '__main__':
                 msg['net'] = copy.deepcopy(local_model.state_dict())
                 msg['model_idx'] = model_idx
                 # [🔥 关键] 回传剩余电量 (归一化 0-1) 供 Server RL 使用
-                msg['battery_level'] = battery_manager.current_charge / battery_manager.total_capacity
+                msg['battery_joules'] = battery_manager.get_charge()
+                msg['battery_level'] = battery_manager.get_ratio()
                 
                 logger.info(f"📤 [Client {ID}] Uploading model & status...")
                 upload_start_time = time.time()

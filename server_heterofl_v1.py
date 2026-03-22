@@ -15,7 +15,7 @@ from utils.get_dataset import *
 from utils.options import args_parser
 from utils.set_seed import set_random_seed
 from utils.utils import save_result
-from utils.power_manager import wake_clients
+from utils.power_manager import BATTERY_CAPACITY, wake_clients
 
 from models.SHFL_resnet import shfl_resnet18
 
@@ -285,6 +285,34 @@ if __name__ == '__main__':
             'L': 0.0 # 稍后填充
         }
 
+    client_battery_joules = {
+        i: float(BATTERY_CAPACITY[id_to_type[i]])
+        for i in range(num_physical_clients)
+    }
+
+    def get_device_capacity(client_id):
+        return float(BATTERY_CAPACITY[id_to_type[client_id]])
+
+    def normalize_battery(client_id, joules):
+        capacity = get_device_capacity(client_id)
+        joules = min(max(float(joules), 0.0), capacity)
+        return joules / capacity
+
+    def restore_battery_from_checkpoint(checkpoint, client_id):
+        if 'battery_state_joules' in checkpoint and client_id in checkpoint['battery_state_joules']:
+            restored = checkpoint['battery_state_joules'][client_id]
+        elif (
+            'client_states' in checkpoint
+            and client_id in checkpoint['client_states']
+            and 'E' in checkpoint['client_states'][client_id]
+        ):
+            legacy_ratio = min(max(float(checkpoint['client_states'][client_id]['E']), 0.0), 1.0)
+            restored = legacy_ratio * get_device_capacity(client_id)
+        else:
+            restored = get_device_capacity(client_id)
+        capacity = get_device_capacity(client_id)
+        return min(max(float(restored), 0.0), capacity)
+
     # ================= [初始化] =================
     set_random_seed(args.seed)
     dataset_train, dataset_test, dict_users = get_dataset(args)
@@ -342,10 +370,11 @@ if __name__ == '__main__':
             if 'active_clients' in checkpoint:
                 active_clients = checkpoint['active_clients']
                 logger.info(f"  Restored active_clients: {active_clients}")
-            if 'client_states' in checkpoint:
-                for idx, state in checkpoint['client_states'].items():
-                    client_states[idx]['E'] = state['E']
-                logger.info(f"  Restored client battery levels")
+            for idx in range(num_physical_clients):
+                restored_j = restore_battery_from_checkpoint(checkpoint, idx)
+                client_battery_joules[idx] = restored_j
+                client_states[idx]['E'] = normalize_battery(idx, restored_j)
+            logger.info("  Restored client battery levels")
             
             logger.success(f"✅ Successfully resumed from Round {start_round}!")
             last_acc = summary_acc_test_collect[-1]
@@ -411,7 +440,7 @@ if __name__ == '__main__':
             device_info_map[idx]['mac']: device_info_map[idx]['ip']
             for idx in idxs_users
         }
-        wake_clients(mac_to_ip_to_wake, total_timeout=15)
+        wake_clients(mac_to_ip_to_wake, total_timeout=15, settle_time=8)
 
         # 5. 下发
         successful_indices = []
@@ -427,6 +456,8 @@ if __name__ == '__main__':
             msg['idxs_list'] = dict_users[idx]
             msg['type'] = 'net'
             msg['round'] = iter
+            msg['battery_joules'] = client_battery_joules[idx]
+            msg['battery_ratio'] = client_states[idx]['E']
             
             logger.info(f"📤 Send to Client {idx} (Model-{model_idx})")
             
@@ -452,15 +483,22 @@ if __name__ == '__main__':
                 continue
             responses_received += 1
             
-            if 'battery_level' in msg:
-                 client_states[client_idx]['E'] = msg['battery_level']
+            if 'battery_joules' in msg:
+                client_battery_joules[client_idx] = min(
+                    max(float(msg['battery_joules']), 0.0),
+                    get_device_capacity(client_idx)
+                )
+                client_states[client_idx]['E'] = normalize_battery(client_idx, client_battery_joules[client_idx])
+            elif 'battery_level' in msg:
+                ratio = min(max(float(msg['battery_level']), 0.0), 1.0)
+                client_battery_joules[client_idx] = ratio * get_device_capacity(client_idx)
+                client_states[client_idx]['E'] = ratio
             
             if msg['type'] == 'status' and msg.get('status') == 'low_battery':
                 logger.warning(f"🪫 Client {client_idx} Low Battery.")
                 connectHandler.sendData(client_idx, {'type': 'shutdown_ack'})
                 if client_idx in active_clients:
                     active_clients.remove(client_idx)
-                    client_states[client_idx]['E'] = 0.0
 
             elif msg['type'] == 'net':
                 logger.info(f"📥 Received from Client {client_idx}")
@@ -512,6 +550,11 @@ if __name__ == '__main__':
             'acc_history': summary_acc_test_collect,
             'active_clients': active_clients,
             'client_states': client_states,
+            'battery_state_joules': client_battery_joules,
+            'battery_state_ratio': {
+                idx: normalize_battery(idx, client_battery_joules[idx])
+                for idx in client_battery_joules
+            },
         }
         
         try:
@@ -534,4 +577,4 @@ if __name__ == '__main__':
         save_result(model_acc_list, f'heterofl_acc_model{model_idx+1}', args)
     
     # 保存最终模型（Model-4）作为主结果（向后兼容）
-    save_result(acc_array[:, 3].tolist(), 'shfl_acc', args)
+    save_result(acc_array[:, 3].tolist(), 'heterofl_acc', args)

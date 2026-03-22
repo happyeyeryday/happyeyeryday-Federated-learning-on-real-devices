@@ -7,6 +7,7 @@ import random
 from loguru import logger
 from torch.utils.data import DataLoader
 import datetime
+import os
 
 # 引入工具类
 from utils.ConnectHandler_server import ConnectHandler
@@ -15,12 +16,17 @@ from utils.get_dataset import *
 from utils.options import args_parser
 from utils.set_seed import set_random_seed
 from utils.utils import save_result
-from utils.power_manager import wake_clients
+from utils.power_manager import BATTERY_CAPACITY, POWER_CONFIG, wake_clients
 
 # [新增] 引入 SHFL 智能体
 from utils.shfl_agent import SHFLAgentManager
 
 from models.SHFL_resnet import shfl_resnet18
+
+# 断点恢复时，如果存在 sleeping 客户端，给它们额外时间完成 WoL 配置并进入 suspend。
+SYNC_SLEEP_PREPARE_TIME = int(os.getenv("SYNC_SLEEP_PREPARE_TIME", "10"))
+# 对 Orin 的兼容策略：断点恢复时仅恢复电量，不恢复 runtime_state（避免恢复阶段 sleep/wake 时序异常）。
+ORIN_SKIP_RUNTIME_RESTORE = os.getenv("ORIN_SKIP_RUNTIME_RESTORE", "1") == "1"
 
 # 全局变量
 net_glob = None
@@ -203,26 +209,38 @@ def stats(dataset, model, args):
     return test_model
 
 def summary_evaluate(net, dataset_test, device):
+    """
+    评估所有 4 个模型的准确率
+    Returns:
+        list: [acc_model1, acc_model2, acc_model3, acc_model4] (百分比形式)
+    """
     net.eval()
     dtLoader = DataLoader(dataset_test, batch_size=128, shuffle=True, num_workers=0)
-    metric = Accumulator(2)
+    
+    # 初始化 4 个模型的累加器
+    num_models = 4
+    metrics = [Accumulator(2) for _ in range(num_models)]
+    
     with torch.no_grad():
         for images, labels in dtLoader:
             images, labels = images.to(device), labels.to(device)
             # Three_ResNet_ALL Forward: (output_list, features_end, embedding)
             outputs = net(images) 
             
-            # Three_ResNet_ALL返回tuple: (output[0-3], features_end, embedding)
-            # output[3]是Model-4的logits（最深层）
+            # Three_ResNet_ALL返回tuple: (output_list[0-3], features_end, embedding)
             if isinstance(outputs, tuple):
-                logits_list = outputs[0]  # 第一个元素是输出列表
-                final_pred = logits_list[-1]  # 取最后一个exit(Model-4)
+                logits_list = outputs[0]  # [model1_out, model2_out, model3_out, model4_out]
             else:
-                # 兼容Three_ResNet（不应该走到这里，但保留以防万一）
-                final_pred = outputs
-
-            metric.add(accuracy(final_pred, labels), labels.numel())
-    return metric[0] / metric[1]
+                # 兼容Three_ResNet（不应该走到这里）
+                logits_list = [outputs]
+            
+            # 计算每个模型的准确率
+            for i, pred in enumerate(logits_list):
+                metrics[i].add(accuracy(pred, labels), labels.numel())
+    
+    # 返回所有准确率（转为百分比）
+    acc_list = [(m[0] / m[1]) * 100 for m in metrics]
+    return acc_list
 
 def init_weights(m):
     if isinstance(m, nn.Linear) or isinstance(m, nn.Conv2d):
@@ -276,6 +294,51 @@ if __name__ == '__main__':
             'L': 0.0 # 稍后填充
         }
 
+    client_battery_joules = {
+        i: float(BATTERY_CAPACITY[id_to_type[i]])
+        for i in range(num_physical_clients)
+    }
+    retired_clients = set()
+    client_runtime_state = {
+        i: 'waiting'
+        for i in range(num_physical_clients)
+    }
+
+    def get_device_capacity(client_id):
+        return float(BATTERY_CAPACITY[id_to_type[client_id]])
+
+    def normalize_battery(client_id, joules):
+        capacity = get_device_capacity(client_id)
+        joules = min(max(float(joules), 0.0), capacity)
+        return joules / capacity
+
+    def restore_battery_from_checkpoint(checkpoint, client_id):
+        if 'battery_state_joules' in checkpoint and client_id in checkpoint['battery_state_joules']:
+            restored = checkpoint['battery_state_joules'][client_id]
+        elif (
+            'client_states' in checkpoint
+            and client_id in checkpoint['client_states']
+            and 'E' in checkpoint['client_states'][client_id]
+        ):
+            legacy_ratio = min(max(float(checkpoint['client_states'][client_id]['E']), 0.0), 1.0)
+            restored = legacy_ratio * get_device_capacity(client_id)
+        else:
+            restored = get_device_capacity(client_id)
+        capacity = get_device_capacity(client_id)
+        return min(max(float(restored), 0.0), capacity)
+
+    def build_runtime_state_snapshot(sleeping_clients=None):
+        sleeping_clients = sleeping_clients or set()
+        snapshot = {}
+        for client_id in range(num_physical_clients):
+            if client_id in retired_clients:
+                snapshot[client_id] = 'retired'
+            elif client_id in sleeping_clients:
+                snapshot[client_id] = 'sleeping'
+            else:
+                snapshot[client_id] = 'waiting'
+        return snapshot
+
     # ================= [初始化] =================
     set_random_seed(args.seed)
     dataset_train, dataset_test, dict_users = get_dataset(args)
@@ -320,9 +383,9 @@ if __name__ == '__main__':
     # ==========================================
     # [新增] 断点续训 - 加载 Checkpoint
     # ==========================================
-    import os
     checkpoint_path = "checkpoint_shfl.pth"
     start_round = 0
+    checkpoint = None
 
     if os.path.exists(checkpoint_path):
         logger.info(f"📂 Found checkpoint: {checkpoint_path}, Resuming...")
@@ -336,10 +399,11 @@ if __name__ == '__main__':
             if 'active_clients' in checkpoint:
                 active_clients = checkpoint['active_clients']
                 logger.info(f"  Restored active_clients: {active_clients}")
-            if 'client_states' in checkpoint:
-                for idx, state in checkpoint['client_states'].items():
-                    client_states[idx]['E'] = state['E']
-                logger.info(f"  Restored client battery levels")
+            for idx in range(num_physical_clients):
+                restored_j = restore_battery_from_checkpoint(checkpoint, idx)
+                client_battery_joules[idx] = restored_j
+                client_states[idx]['E'] = normalize_battery(idx, restored_j)
+            logger.info("  Restored client battery levels")
             
             # [SHFL特有] 恢复RL Agent状态
             if 'rl_agent_state' in checkpoint:
@@ -350,12 +414,103 @@ if __name__ == '__main__':
                     logger.warning(f"  Failed to restore RL Agent: {e}. Will retrain.")
             
             logger.success(f"✅ Successfully resumed from Round {start_round}!")
-            logger.info(f"  Last Acc: {summary_acc_test_collect[-1]:.2f}%")
+            last_acc = summary_acc_test_collect[-1]
+            if isinstance(last_acc, list):
+                logger.info(f"  Last Acc: Model1={last_acc[0]:.2f}%, Model2={last_acc[1]:.2f}%, Model3={last_acc[2]:.2f}%, Model4={last_acc[3]:.2f}%")
+            else:
+                logger.info(f"  Last Acc (Legacy): {last_acc:.2f}%")
         except Exception as e:
             logger.error(f"❌ Failed to resume: {e}. Starting from scratch.")
             start_round = 0
+            checkpoint = None
     else:
         logger.info("🆕 No checkpoint found. Starting from scratch.")
+
+    if checkpoint is not None:
+        if 'retired_clients' in checkpoint:
+            retired_clients = set(checkpoint['retired_clients'])
+        else:
+            for idx in range(num_physical_clients):
+                if idx not in active_clients and client_battery_joules[idx] <= 50.0:
+                    retired_clients.add(idx)
+        active_clients = [idx for idx in active_clients if idx not in retired_clients]
+
+        if 'client_runtime_state' in checkpoint:
+            raw_runtime_state = checkpoint['client_runtime_state']
+            client_runtime_state = {
+                idx: raw_runtime_state.get(idx, 'waiting')
+                for idx in range(num_physical_clients)
+            }
+        else:
+            client_runtime_state = build_runtime_state_snapshot()
+
+        checkpoint_saved_at = checkpoint.get('checkpoint_saved_at')
+        if checkpoint_saved_at is not None:
+            downtime = max(0.0, time.time() - float(checkpoint_saved_at))
+            if downtime > 0:
+                for idx, runtime_state in client_runtime_state.items():
+                    if runtime_state == 'sleeping':
+                        sleep_power = POWER_CONFIG[id_to_type[idx]]['sleep']
+                        client_battery_joules[idx] = max(0.0, client_battery_joules[idx] - sleep_power * downtime)
+                        client_states[idx]['E'] = normalize_battery(idx, client_battery_joules[idx])
+                        if client_battery_joules[idx] <= 50.0:
+                            retired_clients.add(idx)
+                            if idx in active_clients:
+                                active_clients.remove(idx)
+                            client_runtime_state[idx] = 'retired'
+                logger.info(f"  Applied {downtime:.1f}s sleep drain to sleeping clients")
+
+        # 兜底校验：无论 checkpoint 中 active/retired 如何记录，低电量设备都不再参与训练。
+        for idx in range(num_physical_clients):
+            if client_battery_joules[idx] <= 50.0:
+                retired_clients.add(idx)
+                client_runtime_state[idx] = 'retired'
+        active_clients = [idx for idx in active_clients if idx not in retired_clients]
+
+    client_runtime_state = build_runtime_state_snapshot(
+        {
+            idx for idx, state in client_runtime_state.items()
+            if state == 'sleeping' and idx not in retired_clients
+        }
+    )
+
+    if ORIN_SKIP_RUNTIME_RESTORE:
+        for idx in range(num_physical_clients):
+            if id_to_type[idx] == 'orin' and idx not in retired_clients:
+                if client_runtime_state.get(idx) != 'waiting':
+                    logger.warning(
+                        f"Applying Orin resume override for Client {idx}: "
+                        f"{client_runtime_state.get(idx)} -> waiting"
+                    )
+                client_runtime_state[idx] = 'waiting'
+
+    for idx in range(num_physical_clients):
+        logger.info(
+            f"🔋 [ResumeSync] Client {idx}: "
+            f"{client_battery_joules[idx]:.2f} J "
+            f"({normalize_battery(idx, client_battery_joules[idx]) * 100:.2f}%), "
+            f"state={client_runtime_state[idx]}"
+        )
+        sync_msg = {
+            'type': 'sync_state',
+            'battery_joules': client_battery_joules[idx],
+            'battery_level': normalize_battery(idx, client_battery_joules[idx]),
+            'runtime_state': client_runtime_state[idx],
+        }
+        if not connectHandler.sendData(idx, sync_msg):
+            logger.warning(f"⚠️ Failed to sync state to Client {idx}. Removing from active pool.")
+            if idx in active_clients:
+                active_clients.remove(idx)
+
+    sleeping_clients_after_resume = [
+        idx for idx, state in client_runtime_state.items() if state == 'sleeping'
+    ]
+    if sleeping_clients_after_resume:
+        logger.info(
+            f"⏸️ Detected {len(sleeping_clients_after_resume)} sleeping clients in resumed state. "
+            f"Waiting {SYNC_SLEEP_PREPARE_TIME}s for clients to finish sleep preparation..."
+        )
+        time.sleep(SYNC_SLEEP_PREPARE_TIME)
 
     # ================= [训练循环] =================
     for iter in range(start_round, args.epochs):
@@ -414,7 +569,7 @@ if __name__ == '__main__':
             device_info_map[idx]['mac']: device_info_map[idx]['ip']
             for idx in idxs_users
         }
-        wake_clients(mac_to_ip_to_wake, total_timeout=15)
+        wake_clients(mac_to_ip_to_wake, total_timeout=15, settle_time=8)
 
         # 5. 下发
         successful_indices = []
@@ -430,6 +585,8 @@ if __name__ == '__main__':
             msg['idxs_list'] = dict_users[idx]
             msg['type'] = 'net'
             msg['round'] = iter
+            msg['battery_joules'] = client_battery_joules[idx]
+            msg['battery_ratio'] = client_states[idx]['E']
             
             logger.info(f"📤 Send to Client {idx} (Model-{model_idx})")
             
@@ -442,6 +599,7 @@ if __name__ == '__main__':
         # 6. 接收
         w_local_client = []
         model_indices_this_round = []
+        sleeping_clients_this_round = set()
         
         responses_received = 0
         expected_responses = len(successful_indices)
@@ -455,20 +613,39 @@ if __name__ == '__main__':
                 continue
             responses_received += 1
             
-            if 'battery_level' in msg:
-                 client_states[client_idx]['E'] = msg['battery_level']
+            if 'battery_joules' in msg:
+                client_battery_joules[client_idx] = min(
+                    max(float(msg['battery_joules']), 0.0),
+                    get_device_capacity(client_idx)
+                )
+                client_states[client_idx]['E'] = normalize_battery(client_idx, client_battery_joules[client_idx])
+                logger.info(
+                    f"🔋 Client {client_idx} battery update: "
+                    f"{client_battery_joules[client_idx]:.2f} J "
+                    f"({client_states[client_idx]['E'] * 100:.2f}%)"
+                )
+            elif 'battery_level' in msg:
+                ratio = min(max(float(msg['battery_level']), 0.0), 1.0)
+                client_battery_joules[client_idx] = ratio * get_device_capacity(client_idx)
+                client_states[client_idx]['E'] = ratio
+                logger.info(
+                    f"🔋 Client {client_idx} battery update: "
+                    f"{client_battery_joules[client_idx]:.2f} J "
+                    f"({client_states[client_idx]['E'] * 100:.2f}%)"
+                )
             
             if msg['type'] == 'status' and msg.get('status') == 'low_battery':
                 logger.warning(f"🪫 Client {client_idx} Low Battery.")
+                retired_clients.add(client_idx)
                 connectHandler.sendData(client_idx, {'type': 'shutdown_ack'})
                 if client_idx in active_clients:
                     active_clients.remove(client_idx)
-                    client_states[client_idx]['E'] = 0.0
 
             elif msg['type'] == 'net':
                 logger.info(f"📥 Received from Client {client_idx}")
                 w_local_client.append(msg['net'])
                 model_indices_this_round.append(client_model_map[client_idx])
+                sleeping_clients_this_round.add(client_idx)
                 connectHandler.sendData(client_idx, {'type': 'upload_ack'})
 
         # 7. 聚合
@@ -482,20 +659,29 @@ if __name__ == '__main__':
         net_glob_calibrated = stats(dataset_train, net_glob, args)
         net_glob.load_state_dict(net_glob_calibrated.state_dict(), strict=False)
         
-        acc = summary_evaluate(net_glob, dataset_test, args.device) * 100
-        summary_acc_test_collect.append(acc)
+        # 评估所有模型
+        acc_list = summary_evaluate(net_glob, dataset_test, args.device)  # [acc1, acc2, acc3, acc4]
+        summary_acc_test_collect.append(acc_list)
         
         # 记录本轮结束时间和持续时长
         round_end_time = datetime.datetime.now()
         round_duration = (round_end_time - round_start_time).total_seconds()
         
         print("\n" + "="*60)
-        print(f"📊 Round {iter}: Global Acc = {acc:.2f}%")
+        print(f"📊 Round {iter} Accuracy Results:")
+        print(f"   Model 1 (After Block 0): {acc_list[0]:.2f}%")
+        print(f"   Model 2 (After Block 1): {acc_list[1]:.2f}%")
+        print(f"   Model 3 (After Block 2): {acc_list[2]:.2f}%")
+        print(f"   Model 4 (After Block 3): {acc_list[3]:.2f}%")
         print(f"🕐 Round Duration: {round_duration:.2f}s")
         print("="*60 + "\n")
         
         # 输出CSV格式数据，方便后续分析
-        logger.info(f"RESULT_CSV,{iter},{acc:.2f},{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
+        logger.info(f"RESULT_CSV,{iter},{acc_list[0]:.2f},{acc_list[1]:.2f},{acc_list[2]:.2f},{acc_list[3]:.2f},"
+                   f"{round_start_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},"
+                   f"{round_end_time.strftime('%Y-%m-%d %H:%M:%S.%f')[:-3]},{round_duration:.2f}")
+
+        client_runtime_state = build_runtime_state_snapshot(sleeping_clients_this_round)
         
         # ==========================================
         # [新增] 断点续训 - 保存 Checkpoint
@@ -510,6 +696,14 @@ if __name__ == '__main__':
             # [SHFL特有] 保存client状态和活跃列表
             'active_clients': active_clients,
             'client_states': client_states,
+            'battery_state_joules': client_battery_joules,
+            'battery_state_ratio': {
+                idx: normalize_battery(idx, client_battery_joules[idx])
+                for idx in client_battery_joules
+            },
+            'retired_clients': sorted(retired_clients),
+            'client_runtime_state': client_runtime_state,
+            'checkpoint_saved_at': time.time(),
             # [SHFL特有] 保存RL Agent状态
             'rl_agent_state': rl_agent.get_state() if hasattr(rl_agent, 'get_state') else None,
         }
@@ -517,8 +711,21 @@ if __name__ == '__main__':
         try:
             torch.save(state, checkpoint_path_tmp)
             os.replace(checkpoint_path_tmp, checkpoint_path)  # 原子操作，避免文件损坏
-            logger.info(f"💾 Checkpoint saved (Round {iter}, Acc {acc:.2f}%)")
+            logger.info(f"💾 Checkpoint saved (Round {iter}, Model4_Acc {acc_list[3]:.2f}%)")
         except Exception as e:
             logger.error(f"Failed to save checkpoint: {e}")
 
-    save_result(summary_acc_test_collect, 'shfl_acc', args)
+    # 保存结果
+    acc_array = np.array(summary_acc_test_collect)  # Shape: (num_rounds, 4)
+    
+    # 保存为 numpy 数组（方便分析）
+    np.save('shfl_acc_all_models.npy', acc_array)
+    logger.info(f"💾 Saved all models accuracy to shfl_acc_all_models.npy (shape: {acc_array.shape})")
+    
+    # 分别保存每个模型的结果
+    for model_idx in range(4):
+        model_acc_list = acc_array[:, model_idx].tolist()
+        save_result(model_acc_list, f'shfl_acc_model{model_idx+1}', args)
+    
+    # 保存最深模型（Model-4）作为主结果（向后兼容）
+    save_result(acc_array[:, 3].tolist(), 'shfl_acc', args)
