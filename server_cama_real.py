@@ -2,8 +2,10 @@ import copy
 import json
 import os
 import time
+from datetime import datetime
 from pathlib import Path
 
+import numpy as np
 import torch
 from loguru import logger
 from torch import nn
@@ -12,21 +14,27 @@ from torch.utils.data import DataLoader
 from models.SHFL_resnet import shfl_resnet18
 from utils.ConnectHandler_server import ConnectHandler
 from utils.FL_utils import Accumulator, accuracy
-from utils.get_dataset import get_dataset
-from utils.helcfl_real_profiles import (
+from utils.cama_real_profiles import (
+    COOLDOWN_ROUNDS,
+    FAILURE_TOLERANCE,
+    LAG_TOLERANCE_SEC,
+    cama_utility,
     choose_dvfs_label,
     choose_model_idx,
+    device_strength,
     dvfs_mode_for,
-    estimated_cost,
+    fairness_penalty,
     get_device_type,
+    is_on_cooldown,
     model_depth_ratio_from_idx,
 )
+from utils.get_dataset import get_dataset
 from utils.options import args_parser
 from utils.power_manager_real import get_device_capacity, normalize_battery
 from utils.set_seed import set_random_seed
 
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-CHECKPOINT_PATH = "checkpoint_helcfl_real.pth"
+CHECKPOINT_PATH = "checkpoint_cama_real.pth"
 
 
 def now_str():
@@ -144,15 +152,21 @@ def summary_evaluate(net, dataset_test, device):
     return [(metric[0] / metric[1]) * 100 for metric in metrics]
 
 
-def select_clients(active_clients, target_m, appearance_counter, utility_eta):
-    scored = []
-    for cid in active_clients:
-        device_type = get_device_type(cid)
-        model_idx = choose_model_idx(device_type, appearance_counter[cid])
-        utility = (utility_eta ** appearance_counter[cid]) / estimated_cost(device_type, model_idx)
-        scored.append((utility, cid, model_idx, device_type))
-    scored.sort(reverse=True)
-    return scored[:target_m]
+def parse_timestamp(value):
+    if not value:
+        return None
+    try:
+        return datetime.strptime(value, TIME_FORMAT)
+    except (TypeError, ValueError):
+        return None
+
+
+def duration_seconds(start_value, end_value):
+    start_dt = parse_timestamp(start_value)
+    end_dt = parse_timestamp(end_value)
+    if start_dt is None or end_dt is None:
+        return None
+    return max(0.0, (end_dt - start_dt).total_seconds())
 
 
 def capacity_for_cid(cid):
@@ -161,6 +175,86 @@ def capacity_for_cid(cid):
 
 def battery_ratio_for_cid(cid, joules):
     return normalize_battery(get_device_type(cid), joules)
+
+
+def build_candidate_pool(active_clients, round_idx, target_m, failure_counter, last_selected_round):
+    tolerated = [cid for cid in active_clients if failure_counter[cid] <= FAILURE_TOLERANCE]
+    if not tolerated:
+        return []
+
+    ready = [
+        cid
+        for cid in tolerated
+        if not is_on_cooldown(last_selected_round[cid], round_idx, COOLDOWN_ROUNDS)
+    ]
+    if len(ready) >= target_m:
+        return ready
+    return tolerated
+
+
+def select_clients(
+    candidate_ids,
+    target_m,
+    appearance_counter,
+    weighted_participation,
+    failure_counter,
+    last_model_idx,
+    last_round_duration,
+):
+    mean_weighted_participation = (
+        float(np.mean([weighted_participation[cid] for cid in candidate_ids])) if candidate_ids else 0.0
+    )
+    scored = []
+
+    for cid in candidate_ids:
+        device_type = get_device_type(cid)
+        lagged_last_round = (
+            last_round_duration[cid] is not None and last_round_duration[cid] > LAG_TOLERANCE_SEC
+        )
+        model_idx = choose_model_idx(
+            device_type=device_type,
+            appearance_count=appearance_counter[cid],
+            failure_count=failure_counter[cid],
+            lagged_last_round=lagged_last_round,
+            last_model_idx=last_model_idx[cid],
+        )
+        model_depth_ratio = model_depth_ratio_from_idx(model_idx)
+        utility = cama_utility(
+            device_type=device_type,
+            model_idx=model_idx,
+            weighted_participation=weighted_participation[cid],
+            mean_weighted_participation=mean_weighted_participation,
+        )
+        if lagged_last_round:
+            utility *= 0.85
+        if failure_counter[cid] > 0:
+            utility *= 0.9 ** failure_counter[cid]
+
+        scored.append(
+            {
+                "cid": cid,
+                "device_type": device_type,
+                "model_idx": model_idx,
+                "model_depth_ratio": model_depth_ratio,
+                "utility": utility,
+                "device_strength": device_strength(device_type),
+                "fairness_penalty": fairness_penalty(
+                    weighted_participation[cid], mean_weighted_participation
+                ),
+                "lagged_last_round": lagged_last_round,
+                "weighted_participation": weighted_participation[cid],
+            }
+        )
+
+    scored.sort(
+        key=lambda item: (
+            -item["utility"],
+            item["weighted_participation"],
+            -item["model_idx"],
+            item["cid"],
+        )
+    )
+    return scored[:target_m], mean_weighted_participation
 
 
 def restore_battery_states(checkpoint_state, num_clients):
@@ -179,6 +273,14 @@ def save_checkpoint(
     retired_clients,
     battery_state_joules,
     appearance_counter,
+    weighted_participation,
+    last_selected_round,
+    failure_counter,
+    last_model_idx,
+    last_dvfs_label,
+    last_round_duration,
+    last_upload_duration,
+    last_status,
     round_idx,
 ):
     state = {
@@ -193,6 +295,14 @@ def save_checkpoint(
             cid: battery_ratio_for_cid(cid, battery_state_joules[cid]) for cid in battery_state_joules
         },
         "appearance_counter": appearance_counter,
+        "weighted_participation": weighted_participation,
+        "last_selected_round": last_selected_round,
+        "failure_counter": failure_counter,
+        "last_model_idx": last_model_idx,
+        "last_dvfs_label": last_dvfs_label,
+        "last_round_duration": last_round_duration,
+        "last_upload_duration": last_upload_duration,
+        "last_status": last_status,
     }
     torch.save(state, CHECKPOINT_PATH)
 
@@ -204,14 +314,21 @@ if __name__ == "__main__":
     )
     set_random_seed(args.seed)
 
-    log_dir = Path("logs_real/helcfl_real_server")
+    log_dir = Path("logs_real/cama_real_server")
     log_dir.mkdir(parents=True, exist_ok=True)
-    logger.add(log_dir / f"server_helcfl_real_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    logger.add(log_dir / f"server_cama_real_{time.strftime('%Y%m%d_%H%M%S')}.log")
 
-    utility_eta = 0.9
     num_clients = args.num_users
     target_m = max(int(args.frac * num_clients), 1)
     appearance_counter = {cid: 0 for cid in range(num_clients)}
+    weighted_participation = {cid: 0.0 for cid in range(num_clients)}
+    last_selected_round = {cid: None for cid in range(num_clients)}
+    failure_counter = {cid: 0 for cid in range(num_clients)}
+    last_model_idx = {cid: None for cid in range(num_clients)}
+    last_dvfs_label = {cid: None for cid in range(num_clients)}
+    last_round_duration = {cid: None for cid in range(num_clients)}
+    last_upload_duration = {cid: None for cid in range(num_clients)}
+    last_status = {cid: "idle" for cid in range(num_clients)}
     active_clients = list(range(num_clients))
     retired_clients = set()
     battery_state_joules = {cid: capacity_for_cid(cid) for cid in range(num_clients)}
@@ -219,8 +336,11 @@ if __name__ == "__main__":
     best_acc = 0.0
     start_round = 0
 
-    logger.info("Starting HELCFL real-device server")
-    logger.info(f"device={args.device} num_clients={num_clients} frac={args.frac} local_ep={args.local_ep}")
+    logger.info("Starting CAMA real-device server")
+    logger.info(
+        f"device={args.device} num_clients={num_clients} frac={args.frac} "
+        f"local_ep={args.local_ep} cooldown={COOLDOWN_ROUNDS} failure_tolerance={FAILURE_TOLERANCE}"
+    )
 
     dataset_train, dataset_test, dict_users = get_dataset(args)
     net_glob = shfl_resnet18(num_classes=args.num_classes)
@@ -235,6 +355,14 @@ if __name__ == "__main__":
         retired_clients = set(checkpoint.get("retired_clients", []))
         battery_state_joules = restore_battery_states(checkpoint, num_clients)
         appearance_counter.update(checkpoint.get("appearance_counter", {}))
+        weighted_participation.update(checkpoint.get("weighted_participation", {}))
+        last_selected_round.update(checkpoint.get("last_selected_round", {}))
+        failure_counter.update(checkpoint.get("failure_counter", {}))
+        last_model_idx.update(checkpoint.get("last_model_idx", {}))
+        last_dvfs_label.update(checkpoint.get("last_dvfs_label", {}))
+        last_round_duration.update(checkpoint.get("last_round_duration", {}))
+        last_upload_duration.update(checkpoint.get("last_upload_duration", {}))
+        last_status.update(checkpoint.get("last_status", {}))
         start_round = int(checkpoint.get("round", -1)) + 1
         logger.info(f"Resumed from checkpoint {CHECKPOINT_PATH} at round {start_round}")
 
@@ -242,52 +370,74 @@ if __name__ == "__main__":
 
     for round_idx in range(start_round, args.epochs):
         round_start = time.time()
-        selected_plan = select_clients(active_clients, target_m, appearance_counter, utility_eta)
+        candidate_ids = build_candidate_pool(
+            active_clients=active_clients,
+            round_idx=round_idx,
+            target_m=target_m,
+            failure_counter=failure_counter,
+            last_selected_round=last_selected_round,
+        )
+        selected_plan, mean_weighted = select_clients(
+            candidate_ids=candidate_ids,
+            target_m=target_m,
+            appearance_counter=appearance_counter,
+            weighted_participation=weighted_participation,
+            failure_counter=failure_counter,
+            last_model_idx=last_model_idx,
+            last_round_duration=last_round_duration,
+        )
         if not selected_plan:
-            logger.warning("No active clients left, stopping.")
+            logger.warning("No eligible CAMA candidates left, stopping.")
             break
 
         plan_by_cid = {}
         selected_ids = []
-        for rank, (_, cid, model_idx, device_type) in enumerate(selected_plan):
-            model_depth_ratio = model_depth_ratio_from_idx(model_idx)
-            dvfs_label = choose_dvfs_label(model_idx, rank)
-            dvfs_mode = dvfs_mode_for(device_type, dvfs_label)
+        send_failures = []
+        for rank, item in enumerate(selected_plan):
+            cid = item["cid"]
+            item["dvfs_label"] = choose_dvfs_label(item["model_idx"], rank)
+            item["dvfs_mode"] = dvfs_mode_for(item["device_type"], item["dvfs_label"])
             payload = {
                 "type": "train_round",
                 "round": round_idx,
-                "net": shfl_distribute(net_glob.state_dict(), model_idx),
+                "net": shfl_distribute(net_glob.state_dict(), item["model_idx"]),
                 "idxs_list": dict_users[cid],
-                "model_idx": model_idx,
-                "model_depth_ratio": model_depth_ratio,
-                "dvfs_label": dvfs_label,
-                "dvfs_mode": dvfs_mode,
+                "model_idx": item["model_idx"],
+                "model_depth_ratio": item["model_depth_ratio"],
+                "dvfs_label": item["dvfs_label"],
+                "dvfs_mode": item["dvfs_mode"],
                 "local_ep": args.local_ep,
                 "lr": args.lr * (args.lr_decay ** round_idx),
                 "battery_joules": battery_state_joules[cid],
                 "battery_level": battery_ratio_for_cid(cid, battery_state_joules[cid]),
             }
-            if not connect_handler.sendData(cid, payload):
-                logger.warning(f"Failed to send round {round_idx} to cid={cid}, skipping.")
-                continue
-            selected_ids.append(cid)
-            plan_by_cid[cid] = {
-                "device_type": device_type,
-                "model_idx": model_idx,
-                "model_depth_ratio": model_depth_ratio,
-                "dvfs_label": dvfs_label,
-                "dvfs_mode": dvfs_mode,
-            }
+            logger.info(
+                f"{now_str()} ROUND={round_idx} SEND cid={cid} type={item['device_type']} "
+                f"model_idx={item['model_idx']} depth_ratio={item['model_depth_ratio']:.2f} "
+                f"dvfs_mode={item['dvfs_mode']} utility={item['utility']:.4f}"
+            )
+            if connect_handler.sendData(cid, payload):
+                selected_ids.append(cid)
+                plan_by_cid[cid] = item
+                last_selected_round[cid] = round_idx
+                last_model_idx[cid] = item["model_idx"]
+                last_dvfs_label[cid] = item["dvfs_label"]
+            else:
+                failure_counter[cid] += 1
+                last_status[cid] = "send_failed"
+                send_failures.append({"cid": cid, "reason": "send_failed"})
 
         if not selected_ids:
-            logger.warning("No selected clients received the round payload, stopping.")
+            logger.warning("No selected CAMA clients received the round payload, stopping.")
             break
 
         logger.info(
-            f"{now_str()} ROUND={round_idx} selected={selected_ids} "
+            f"{now_str()} ROUND={round_idx} candidates={candidate_ids} selected={selected_ids} "
+            f"types={[plan_by_cid[c]['device_type'] for c in selected_ids]} "
             f"model_indices={[plan_by_cid[c]['model_idx'] for c in selected_ids]} "
             f"depth_ratios={[plan_by_cid[c]['model_depth_ratio'] for c in selected_ids]} "
-            f"dvfs_modes={[plan_by_cid[c]['dvfs_mode'] for c in selected_ids]}"
+            f"dvfs_modes={[plan_by_cid[c]['dvfs_mode'] for c in selected_ids]} "
+            f"mean_weighted={mean_weighted:.4f}"
         )
 
         local_models = []
@@ -295,7 +445,10 @@ if __name__ == "__main__":
         responses = 0
         expected = len(selected_ids)
         upload_order = []
+        successful_clients = []
+        round_failures = list(send_failures)
         round_retired = []
+
         while responses < expected:
             msg, cid = connect_handler.receiveData()
             msg_type = msg.get("type")
@@ -311,34 +464,52 @@ if __name__ == "__main__":
                     1.0,
                 ) * capacity_for_cid(cid)
 
-            if msg_type == "client_update" and msg.get("round") == round_idx:
+            if msg_type == "client_update" and msg.get("round") == round_idx and cid in plan_by_cid:
                 responses += 1
                 upload_order.append(cid)
+                successful_clients.append(cid)
                 local_models.append(msg["net"])
                 local_indices.append(int(msg["model_idx"]))
+
+                train_duration = duration_seconds(msg.get("train_start_time"), msg.get("train_end_time"))
+                upload_duration = duration_seconds(msg.get("upload_start_time"), msg.get("upload_end_time"))
+                last_round_duration[cid] = train_duration
+                last_upload_duration[cid] = upload_duration
                 appearance_counter[cid] += 1
+                weighted_participation[cid] += float(msg.get("model_depth_ratio", int(msg["model_idx"]) / 4.0))
+                failure_counter[cid] = 0
+                last_status[cid] = msg.get("status", "ok")
+
                 logger.info(
-                    f"{now_str()} RECV cid={cid} "
+                    f"{now_str()} ROUND={round_idx} RECV cid={cid} status={msg.get('status', 'ok')} "
                     f"train=({msg.get('train_start_time')},{msg.get('train_end_time')}) "
                     f"upload=({msg.get('upload_start_time')},{msg.get('upload_end_time')}) "
-                    f"dvfs_mode={msg.get('dvfs_mode')} "
-                    f"battery={battery_state_joules[cid]:.2f}J"
+                    f"dvfs_mode={msg.get('dvfs_mode')} battery={battery_state_joules[cid]:.2f}J"
                 )
                 connect_handler.sendData(cid, {"type": "upload_ack", "round": round_idx})
-            elif msg_type == "status" and msg.get("status") == "low_battery":
+            elif msg_type == "status" and msg.get("status") == "low_battery" and cid in plan_by_cid:
                 responses += 1
                 retired_clients.add(cid)
                 if cid in active_clients:
                     active_clients.remove(cid)
                 round_retired.append(cid)
+                last_status[cid] = "low_battery"
+                connect_handler.sendData(cid, {"type": "shutdown_ack", "round": round_idx})
                 logger.warning(
                     f"Client {cid} low battery at round {round_idx}, retiring with "
                     f"{battery_state_joules[cid]:.2f}J"
                 )
-                connect_handler.sendData(cid, {"type": "shutdown_ack", "round": round_idx})
-            elif msg_type == "client_error":
+            elif msg_type == "client_error" and msg.get("round") == round_idx and cid in plan_by_cid:
                 responses += 1
-                logger.warning(f"Client {cid} failed round {round_idx}: {msg.get('reason')}")
+                failure_counter[cid] += 1
+                last_status[cid] = msg.get("status", "client_error")
+                round_failures.append(
+                    {"cid": cid, "reason": msg.get("failure_reason", msg.get("reason", "client_error"))}
+                )
+                logger.warning(
+                    f"Client {cid} failed round {round_idx}: "
+                    f"{msg.get('failure_reason', msg.get('reason', 'client_error'))}"
+                )
             else:
                 logger.warning(f"Unknown message from cid={cid}: {msg}")
 
@@ -353,13 +524,17 @@ if __name__ == "__main__":
 
         record = {
             "round": round_idx,
+            "candidate_clients": candidate_ids,
             "selected_clients": selected_ids,
             "selected_device_types": [plan_by_cid[c]["device_type"] for c in selected_ids],
             "selected_model_indices": [plan_by_cid[c]["model_idx"] for c in selected_ids],
             "selected_model_depth_ratios": [plan_by_cid[c]["model_depth_ratio"] for c in selected_ids],
             "selected_dvfs_modes": [plan_by_cid[c]["dvfs_mode"] for c in selected_ids],
-            "upload_order": upload_order,
+            "successful_clients": successful_clients,
+            "failed_clients": round_failures,
             "retired_clients": round_retired,
+            "upload_order": upload_order,
+            "mean_weighted_participation": mean_weighted,
             "battery_state_joules": {cid: battery_state_joules[cid] for cid in range(num_clients)},
             "acc_all_models": acc_list,
             "acc_model4": acc_list[-1],
@@ -369,8 +544,8 @@ if __name__ == "__main__":
         summary_records.append(record)
         logger.info(
             f"{now_str()} ROUND={round_idx} acc_model4={acc_list[-1]:.4f} "
-            f"all_acc={acc_list} best_acc={best_acc:.4f} "
-            f"duration={round_duration:.2f}s active={active_clients}"
+            f"all_acc={acc_list} best_acc={best_acc:.4f} duration={round_duration:.2f}s "
+            f"active={active_clients}"
         )
         save_checkpoint(
             model=net_glob,
@@ -380,6 +555,14 @@ if __name__ == "__main__":
             retired_clients=retired_clients,
             battery_state_joules=battery_state_joules,
             appearance_counter=appearance_counter,
+            weighted_participation=weighted_participation,
+            last_selected_round=last_selected_round,
+            failure_counter=failure_counter,
+            last_model_idx=last_model_idx,
+            last_dvfs_label=last_dvfs_label,
+            last_round_duration=last_round_duration,
+            last_upload_duration=last_upload_duration,
+            last_status=last_status,
             round_idx=round_idx,
         )
 
@@ -391,9 +574,12 @@ if __name__ == "__main__":
 
     summary_path = log_dir / f"summary_{time.strftime('%Y%m%d_%H%M%S')}.json"
     summary = {
-        "algorithm": "helcfl_real",
+        "algorithm": "cama_real",
         "model_family": "shfl_resnet18",
         "heterogeneity": "depth/model_idx",
+        "training_objective": "single_exit_cross_entropy",
+        "self_distillation": False,
+        "dvfs_policy": "helcfl_aligned_fixed_rule",
         "dataset": args.dataset,
         "model": args.model,
         "num_users": args.num_users,

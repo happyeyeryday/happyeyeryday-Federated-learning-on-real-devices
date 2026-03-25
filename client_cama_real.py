@@ -11,8 +11,8 @@ from tqdm import tqdm
 
 from models.SHFL_resnet import shfl_resnet18
 from utils.ConnectHandler_client import ConnectHandler
+from utils.cama_real_profiles import DEVICE_DVFS_MODES, get_device_type
 from utils.get_dataset import DatasetSplit, get_dataset
-from utils.helcfl_real_profiles import DEVICE_DVFS_MODES, get_device_type
 from utils.options import args_parser
 from utils.power_manager_real import BatteryManagerReal, LOW_BATTERY_THRESHOLD_J
 from utils.set_seed import set_random_seed
@@ -89,12 +89,12 @@ if __name__ == "__main__":
 
     device_type = get_device_type(args.CID)
     battery_manager = BatteryManagerReal(device_type=device_type)
-    log_dir = Path("logs_real/helcfl_real_client")
+    log_dir = Path("logs_real/cama_real_client")
     log_dir.mkdir(parents=True, exist_ok=True)
-    logger.add(log_dir / f"client_helcfl_real_{args.CID}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    logger.add(log_dir / f"client_cama_real_{args.CID}_{time.strftime('%Y%m%d_%H%M%S')}.log")
 
     logger.info(
-        f"Starting HELCFL real client cid={args.CID} device_type={device_type} "
+        f"Starting CAMA real client cid={args.CID} device_type={device_type} "
         f"gpu={args.gpu} modes={DEVICE_DVFS_MODES[device_type]}"
     )
 
@@ -172,6 +172,9 @@ if __name__ == "__main__":
                     "type": "client_error",
                     "round": round_idx,
                     "cid": args.CID,
+                    "device_type": device_type,
+                    "status": "client_error",
+                    "failure_reason": f"dvfs_failed:{exc}",
                     "reason": f"dvfs_failed:{exc}",
                     "battery_joules": battery_manager.get_charge(),
                     "battery_level": battery_manager.get_ratio(),
@@ -246,6 +249,9 @@ if __name__ == "__main__":
             {
                 "type": "client_update",
                 "cid": args.CID,
+                "device_type": device_type,
+                "status": "ok",
+                "failure_reason": "",
                 "round": round_idx,
                 "model_idx": model_idx,
                 "model_depth_ratio": model_depth_ratio,

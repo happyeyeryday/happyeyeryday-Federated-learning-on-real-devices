@@ -5,22 +5,17 @@ from scp import SCPClient
 
 from device_config import ALL_DEVICES
 
-# ================= 配置区域 =================
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 REMOTE_ROOT = "~/server_fedavg"
 
-# 共享配置文件，同步给 server + 所有 client
 FILES_TO_TRANSFER = [
     "utils/options.py",
-    "utils/helcfl_real_profiles.py",
+    "utils/cama_real_profiles.py",
     "utils/power_manager_real.py",
 ]
 
 DEVICES = ALL_DEVICES
 
-
-# ================= 核心逻辑 =================
 
 def create_ssh_client(ip, user, pwd):
     client = paramiko.SSHClient()
@@ -41,7 +36,7 @@ def remote_dir_for(relative_path):
 
 
 def upload_files():
-    print("🚀 开始同步共享配置...")
+    print("🚀 开始同步 CAMA real 共享配置...")
     print(f"📦 待传输文件: {len(FILES_TO_TRANSFER)} 个")
     print(f"🤖 目标设备: {len(DEVICES)} 台")
     print("-" * 50)

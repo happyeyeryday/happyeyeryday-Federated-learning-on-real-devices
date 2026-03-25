@@ -12,6 +12,8 @@ scripts/*.xlsx
 scripts/**/*.csv
 scripts/**/*.txt
 scripts/**/*.xlsx
+deploy_sh/devices_local.py
+docs/*.pdf
 
 # --- Python 通用忽略 (必须添加) ---
 __pycache__/
