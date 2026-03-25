@@ -91,7 +91,10 @@ if __name__ == "__main__":
     battery_manager = BatteryManagerReal(device_type=device_type)
     log_dir = Path("logs_real/helcfl_real_client")
     log_dir.mkdir(parents=True, exist_ok=True)
-    logger.add(log_dir / f"client_helcfl_real_{args.CID}_{time.strftime('%Y%m%d_%H%M%S')}.log")
+    log_prefix = "client_helcfl_real"
+    if args.log_tag:
+        log_prefix = f"{log_prefix}_{args.log_tag}"
+    logger.add(log_dir / f"{log_prefix}_{args.CID}_{time.strftime('%Y%m%d_%H%M%S')}.log")
 
     logger.info(
         f"Starting HELCFL real client cid={args.CID} device_type={device_type} "

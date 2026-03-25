@@ -15,6 +15,7 @@ FILES_TO_TRANSFER = [
     "utils/options.py",
     "utils/helcfl_real_profiles.py",
     "utils/power_manager_real.py",
+    "utils/main_real_policy.py",
 ]
 
 DEVICES = ALL_DEVICES

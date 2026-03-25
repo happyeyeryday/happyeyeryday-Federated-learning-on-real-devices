@@ -13,7 +13,9 @@ REMOTE_ROOT = "~/server_fedavg"
 # 服务端需要同步的 HELCFL real 相关文件
 FILES_TO_TRANSFER = [
     "server_helcfl_real.py",
+    "server_main_real.py",
     "utils/helcfl_real_profiles.py",
+    "utils/main_real_policy.py",
     "utils/power_manager_real.py",
     "utils/options.py",
 ]

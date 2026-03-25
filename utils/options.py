@@ -94,5 +94,9 @@ def args_parser():
     parser.add_argument("--HOST", default='192.168.31.105', type=str)
     parser.add_argument("--POST", default=8080, type=int)
     parser.add_argument("--CID", default=0, type=int)
+    parser.add_argument("--policy_bundle", default='', type=str)
+    parser.add_argument("--policy_manifest", default='', type=str)
+    parser.add_argument("--policy_mode", default='offline_bundle', type=str)
+    parser.add_argument("--log_tag", default='', type=str)
     args = parser.parse_args()
     return args
