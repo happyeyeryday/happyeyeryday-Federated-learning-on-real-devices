@@ -13,14 +13,14 @@ from models.SHFL_resnet import shfl_resnet18
 from utils.ConnectHandler_server import ConnectHandler
 from utils.FL_utils import Accumulator, accuracy
 from utils.get_dataset import get_dataset
-from utils.helcfl_real_profiles import get_device_type
 from utils.main_real_policy import MainRealPolicy, estimate_idle_drain_joules
+from utils.main_real_profiles import get_device_type
 from utils.options import args_parser
 from utils.power_manager_real import LOW_BATTERY_THRESHOLD_J, get_device_capacity, normalize_battery
 from utils.set_seed import set_random_seed
 
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-CHECKPOINT_PATH = "checkpoint_main_real.pth"
+CHECKPOINT_PATH = "checkpoint_main_real_byot.pth"
 
 
 def now_str():
@@ -28,74 +28,68 @@ def now_str():
 
 
 def shfl_distribute(global_model_state, model_idx):
+    """Slice the BYOT global model for a distill-capable client model."""
     local_state = {}
-    target_exit_idx = model_idx - 1
+    keep_upto = int(model_idx) - 1
 
-    for k, v in global_model_state.items():
-        if "num_batches_tracked" in k or "running_mean" in k or "running_var" in k:
+    for key, value in global_model_state.items():
+        if "num_batches_tracked" in key or "running_mean" in key or "running_var" in key:
             continue
-        if k.startswith("conv1") or k.startswith("bn1"):
-            local_state[k] = v.clone()
-        elif k.startswith("mainblocks"):
+
+        if key.startswith("conv1") or key.startswith("bn1"):
+            local_state[key] = value.clone()
+            continue
+
+        if key.startswith("mainblocks"):
             try:
-                block_id = int(k.split(".")[1])
+                block_id = int(key.split(".")[1])
             except Exception:
                 continue
-            if block_id <= target_exit_idx:
-                local_state[k] = v.clone()
-        elif k.startswith("bottlenecks"):
+            if block_id <= keep_upto:
+                local_state[key] = value.clone()
+            continue
+
+        if key.startswith("bottlenecks") or key.startswith("fcs"):
             try:
-                exit_id = int(k.split(".")[1])
+                exit_id = int(key.split(".")[1])
             except Exception:
                 continue
-            if exit_id == target_exit_idx:
-                local_state["bottleneck." + ".".join(k.split(".")[2:])] = v.clone()
-        elif k.startswith("fcs"):
-            try:
-                exit_id = int(k.split(".")[1])
-            except Exception:
-                continue
-            if exit_id == target_exit_idx:
-                local_state["fc." + ".".join(k.split(".")[2:])] = v.clone()
+            if exit_id <= keep_upto:
+                local_state[key] = value.clone()
+
     return local_state
 
 
-def shfl_aggregate(w_local_list, model_indices, net_glob):
+def shfl_aggregate(w_local_list, net_glob):
+    """Aggregate directly by matching BYOT state_dict keys."""
     global_state = net_glob.state_dict()
     sum_buffer = {}
     count_buffer = {}
 
-    for k, v in global_state.items():
-        if "num_batches_tracked" in k:
+    for key, value in global_state.items():
+        if "num_batches_tracked" in key:
             continue
-        sum_buffer[k] = torch.zeros_like(v, dtype=torch.float32)
-        count_buffer[k] = torch.zeros_like(v, dtype=torch.float32)
+        sum_buffer[key] = torch.zeros_like(value, dtype=torch.float32)
+        count_buffer[key] = torch.zeros_like(value, dtype=torch.float32)
 
-    for local_w, model_idx in zip(w_local_list, model_indices):
-        exit_idx = int(model_idx) - 1
-        for k_local, v_local in local_w.items():
-            if k_local.startswith("bottleneck."):
-                suffix = k_local[len("bottleneck.") :]
-                k_global = f"bottlenecks.{exit_idx}.{suffix}"
-            elif k_local.startswith("fc."):
-                suffix = k_local[len("fc.") :]
-                k_global = f"fcs.{exit_idx}.{suffix}"
-            else:
-                k_global = k_local
-            if k_global not in sum_buffer:
+    for local_w in w_local_list:
+        for key, value in local_w.items():
+            if key not in sum_buffer:
                 continue
-            sum_buffer[k_global] += v_local
-            count_buffer[k_global] += 1
+            if "running_mean" in key or "running_var" in key or "num_batches_tracked" in key:
+                continue
+            sum_buffer[key] += value
+            count_buffer[key] += 1
 
     updated_state = {}
-    for k, v in global_state.items():
-        if "num_batches_tracked" in k:
-            updated_state[k] = v
+    for key, value in global_state.items():
+        if "num_batches_tracked" in key:
+            updated_state[key] = value
             continue
-        updated_state[k] = v.clone()
-        mask = count_buffer[k] > 0
+        updated_state[key] = value.clone()
+        mask = count_buffer[key] > 0
         if mask.any():
-            updated_state[k][mask] = (sum_buffer[k][mask] / count_buffer[k][mask]).to(v.dtype)
+            updated_state[key][mask] = (sum_buffer[key][mask] / count_buffer[key][mask]).to(value.dtype)
     return updated_state
 
 
@@ -337,7 +331,7 @@ if __name__ == "__main__":
                 round_retired.append(cid)
 
         if local_models:
-            net_glob.load_state_dict(shfl_aggregate(local_models, local_indices, net_glob), strict=False)
+            net_glob.load_state_dict(shfl_aggregate(local_models, net_glob), strict=False)
 
         calibrated_model = calibrate_bn(dataset_train, net_glob, args)
         acc_list = summary_evaluate(calibrated_model, dataset_test, args.device)
@@ -356,17 +350,19 @@ if __name__ == "__main__":
             "role_ids": {cid: int(plan_by_cid[cid]["role_id"]) for cid in active_clients},
             "action_ids": {cid: int(plan_by_cid[cid]["action_id"]) for cid in active_clients},
             "upload_order": upload_order,
-            "retired_clients": round_retired,
+            "retired_clients": sorted(set(round_retired)),
             "battery_state_joules": {cid: battery_state_joules[cid] for cid in range(num_clients)},
+            "exit_accs": acc_list,
             "acc_all_models": acc_list,
             "acc_model4": acc_list[-1],
             "best_acc": best_acc,
             "round_duration_sec": round_duration,
+            "local_model_indices": local_indices,
         }
         summary_records.append(record)
         logger.info(
-            f"{now_str()} ROUND={round_idx} acc_model4={acc_list[-1]:.4f} best_acc={best_acc:.4f} "
-            f"duration={round_duration:.2f}s active={sorted(active_clients)}"
+            f"{now_str()} ROUND={round_idx} exit_accs={[round(v, 4) for v in acc_list]} "
+            f"best_acc={best_acc:.4f} duration={round_duration:.2f}s active={sorted(active_clients)}"
         )
         save_checkpoint(
             model=net_glob,
@@ -392,7 +388,7 @@ if __name__ == "__main__":
         "policy_mode": args.policy_mode,
         "policy_bundle": args.policy_bundle,
         "policy_manifest": args.policy_manifest or str(Path(args.policy_bundle) / "policy_manifest.json"),
-        "model_family": "shfl_resnet18",
+        "model_family": "shfl_resnet18_distill",
         "heterogeneity": "depth/model_idx",
         "dataset": args.dataset,
         "model": args.model,

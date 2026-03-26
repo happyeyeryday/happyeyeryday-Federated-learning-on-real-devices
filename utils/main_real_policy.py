@@ -6,7 +6,12 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.helcfl_real_profiles import dvfs_mode_for, get_device_type, max_model_idx_for_device
+from utils.main_real_profiles import (
+    dvfs_mode_for,
+    get_device_type,
+    max_model_idx_for_device,
+    model_depth_ratio_from_idx,
+)
 from utils.power_manager_real import LOW_BATTERY_THRESHOLD_J, get_device_capacity
 
 
@@ -305,7 +310,7 @@ class MainRealPolicy:
         return {
             "selected": True,
             "model_idx": int(model_id + 1),
-            "model_depth_ratio": float((model_id + 1) / 4.0),
+            "model_depth_ratio": float(model_depth_ratio_from_idx(model_id + 1)),
             "dvfs_label": dvfs_label,
             "dvfs_mode": int(dvfs_mode_for(device_type, dvfs_label)),
         }

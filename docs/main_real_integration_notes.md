@@ -4,28 +4,25 @@
 
 ## 1. 先回答两个直接问题
 
-### 为什么复用 `client_helcfl_real.py`
+### 为什么现在要单独做 `client_main_real.py`
 
-因为这次主方法接入的变化点在 **server 决策器**，不在 **client 执行器**。
+当前主方法在真实设备上不能再复用 `client_helcfl_real.py`。
 
-当前真实设备 client 做的事情本质上是：
+原因很直接：
 
-1. 接收 server 下发的 `train_round` payload
-2. 切换 DVFS
-3. 按给定 `model_idx` 加载对应子模型
-4. 本地训练
-5. 上传权重和电量状态
+- `client_helcfl_real.py` 是单出口本地训练
+- `main_real` 需要多出口 BYOT/self-distill 本地训练
 
-这些动作对 `HELCFL real` 和 `main_real` 是一样的。  
-主方法真正替换的是“server 每轮如何决定谁训练、训练哪个模型、用哪个 DVFS、谁 idle”。
+所以现在的分工是：
 
-所以：
+- `server_helcfl_real.py` + `client_helcfl_real.py` 继续作为 baseline
+- `server_main_real.py` + `client_main_real.py` 构成主方法
 
-- `client_helcfl_real.py` 不是“完全没区别”
-- 而是“当前协议层面已经够用，不需要再复制一份新 client”
-- 这次只额外加了 `--log_tag`，方便把 `main_real` 和 baseline 的 client 日志分开
+这样做的好处是：
 
-如果后面你想把观测扩展到温度、带宽、内存压力、链路时延这些 **client 本地实时信号**，那时就要继续改 client 协议。
+- baseline 完全不动
+- 主方法的 server/client 语义一致
+- 后续排查问题时不会混淆“调度器改了”还是“本地训练改了”
 
 ### `server_main_real.py` 能不能直接运行
 
@@ -68,37 +65,46 @@ nohup python3 server_main_real.py \
 
 #### 新增
 
-- [server_main_real.py](/tmp/real_devices_master/server_main_real.py)
+- `server_main_real.py`
   - 新的真实设备主方法 server 入口
-  - 基于 `SHFL_resnet` 聚合链路
+  - 基于 `SHFL_resnet + BYOT` 聚合链路
   - 用离线 bundle 做每轮 server 侧推理
 
-- [main_real_policy.py](/tmp/real_devices_master/utils/main_real_policy.py)
+- `utils/main_real_policy.py`
   - 负责加载 `policy_manifest.json`
   - 加载低层 `eval_rnn`
   - 加载高层 `role controller`
   - 维护 `last_actions / current_roles / role_age / hidden states`
   - 生成每轮 `action -> model_idx + dvfs + idle` 计划
 
-- [deploy_main_real.md](/tmp/real_devices_master/docs/deploy_main_real.md)
+- `utils/main_real_profiles.py`
+  - 维护 `main_real` 独立使用的 `model_idx/depth_ratio/DVFS` 语义
+  - 不去污染现有 `HELCFL real` baseline 使用的 profile
+
+- `utils/power_manager_real.py`
+  - 真实设备电量与功耗估算
+  - 提供 server/client 共用的电量接口
+
+- `client_main_real.py`
+  - 新的真实设备主方法 client 入口
+  - 使用 `shfl_resnet18_distill`
+  - 本地训练启用多出口蒸馏
+
+- `docs/deploy_main_real.md`
   - 启动说明
 
 #### 修改
 
-- [options.py](/tmp/real_devices_master/utils/options.py)
+- `utils/options.py`
   - 新增：
     - `--policy_bundle`
     - `--policy_manifest`
     - `--policy_mode`
     - `--log_tag`
 
-- [client_helcfl_real.py](/tmp/real_devices_master/client_helcfl_real.py)
-  - 增加 `--log_tag`
-  - 不改训练协议
-
-- [deploy_seed.py](/tmp/real_devices_master/deploy_sh/deploy_seed.py)
-- [deploy_server.py](/tmp/real_devices_master/deploy_sh/deploy_server.py)
-  - 把 `main_real` 新文件带进 deploy
+- `client_helcfl_real.py`
+  - 仅保留 baseline 用途
+  - 不再承担主方法真实设备训练
 
 ## 3. `main_real` 和 baseline 的区别
 
@@ -194,19 +200,19 @@ baseline 只是用人工 utility 去近似这个目标。
 
 当前真实设备接入策略是：
 
-- **不改 client 训练协议**
-- **不改 SHFL_resnet 聚合链**
-- **只替换 server 决策逻辑**
+- **baseline 不改**
+- **主方法单独提供一对 server/client**
+- **复用底层连接、DVFS、电量管理接口**
 
 这样做的好处是：
 
 - 风险小
 - 更容易和 baseline 做公平对比
-- 一旦结果有差异，更容易归因到“调度策略”而不是“训练链路变了”
+- 一旦结果有差异，更容易归因到“调度策略 + BYOT 训练语义”这条主方法链，而不是 baseline 被污染
 
 所以现在的 `main_real` 可以理解成：
 
-> 在 baseline 的真实设备执行框架上，替换掉它的启发式调度器。
+> 在 baseline 的真实设备执行框架接口上，重建一条独立的主方法 server/client。
 
 ## 6. 当前版本的边界
 

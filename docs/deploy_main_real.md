@@ -14,18 +14,14 @@
 
 ## 2. 同步代码
 
-和 `HELCFL real` 一样，先同步共享配置和代码：
-
-```bash
-python3 deploy_sh/deploy_seed.py
-python3 deploy_sh/deploy_server.py
-python3 deploy_sh/deploy_cluster.py
-```
-
-其中 `deploy_server.py` 现在会额外同步：
+把下面这些文件同步到真实设备使用的代码目录：
 
 - `server_main_real.py`
+- `client_main_real.py`
+- `utils/options.py`
 - `utils/main_real_policy.py`
+- `utils/main_real_profiles.py`
+- `utils/power_manager_real.py`
 
 ## 3. 把 bundle 放到 server
 
@@ -61,11 +57,11 @@ nohup python3 server_main_real.py \
 
 ## 5. 启动 client
 
-client 继续复用 `client_helcfl_real.py`：
+主方法 client 使用 `client_main_real.py`：
 
 ```bash
 cd ~/server_fedavg
-nohup python3 client_helcfl_real.py --CID 0 --log_tag main_real > client_cid0.log 2>&1 &
+nohup python3 client_main_real.py --CID 0 --log_tag main_real > client_cid0.log 2>&1 &
 ```
 
 ## 6. 行为说明

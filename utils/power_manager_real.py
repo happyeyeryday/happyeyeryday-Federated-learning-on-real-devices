@@ -81,14 +81,14 @@ class BatteryManagerReal:
         self.current_charge = float(self.total_capacity)
         self.current_mode_label = str(initial_mode_label)
         logger.info(
-            f"🔋 [BatteryReal] Initialized device_type={device_type} "
+            f"[BatteryReal] Initialized device_type={device_type} "
             f"mode={self.current_mode_label} capacity={self.total_capacity:.1f}J"
         )
 
     def set_charge(self, charge_joules):
         self.current_charge = min(max(float(charge_joules), 0.0), self.total_capacity)
         logger.info(
-            f"🔄 [BatteryReal] Restored charge: "
+            f"[BatteryReal] Restored charge: "
             f"{self.current_charge:.2f}/{self.total_capacity:.2f}J "
             f"({self.get_ratio() * 100:.2f}%)"
         )
@@ -104,7 +104,7 @@ class BatteryManagerReal:
         if mode_label not in POWER_CONFIG[self.device_type]:
             raise ValueError(f"Unknown mode label {mode_label} for {self.device_type}")
         self.current_mode_label = str(mode_label)
-        logger.info(f"⚙️ [BatteryReal] Mode label set to {self.current_mode_label}")
+        logger.info(f"[BatteryReal] Mode label set to {self.current_mode_label}")
 
     def set_power_mode_by_mode_id(self, mode_id):
         mode_label = mode_label_from_id(self.device_type, mode_id)
@@ -130,7 +130,7 @@ class BatteryManagerReal:
         self.current_charge = max(0.0, self.current_charge - consumed_joules)
 
         logger.info(
-            f"⚡ [BatteryReal] activity={activity} mode={active_mode} "
+            f"[BatteryReal] activity={activity} mode={active_mode} "
             f"duration={duration_seconds:.3f}s power={power_w:.4f}W "
             f"consumed={consumed_joules:.4f}J "
             f"remaining={self.current_charge:.2f}/{self.total_capacity:.2f}J "
@@ -143,7 +143,7 @@ class BatteryManagerReal:
         is_enough = self.current_charge > threshold
         if not is_enough:
             logger.warning(
-                f"🪫 [BatteryReal] Low battery: "
+                f"[BatteryReal] Low battery: "
                 f"{self.current_charge:.2f}J <= {threshold:.2f}J"
             )
         return is_enough
